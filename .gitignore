@@ -4,6 +4,9 @@ venv/
 other_bots/
 reference/
 
+# train set not send
+data/*
+
 __pycache__/
 *.py[cod]
 *$py.class

@@ -1,15 +1,11 @@
-// 终极编译器优化指令
-#pragma GCC optimize("O3,unroll-loops,inline-functions")
-#pragma GCC target("popcnt,lzcnt,bmi,bmi2")
-
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <time.h>
 
-// 使用安全且稳定的哨兵值 
-#define PLAY_TO_END_SENTINEL (INT_MIN/2)
+#define MIDGAME_DEPTH 8
 
 typedef uint64_t u64;
 
@@ -20,6 +16,32 @@ typedef struct {
     int score;
 } ScoredMove;
 
+// --- begin: root sampling helpers ---
+typedef struct { int pos; int eval; } EvalMove;
+
+static uint64_t splitmix64_next(void) {
+    static uint64_t x = 0;
+    if (x == 0) {
+        const char* s = getenv("CHASE_SEED");
+        uint64_t seed = s ? strtoull(s, NULL, 10) : (uint64_t)time(NULL);
+        x = seed ? seed : 0x9E3779B97F4A7C15ULL;
+    }
+    uint64_t z = (x += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+static inline double rng_double01(void) {
+    return (splitmix64_next() >> 11) * (1.0 / 9007199254740992.0); // [0,1)
+}
+
+static int compare_eval_desc(const void* a, const void* b) {
+    const EvalMove* x = (const EvalMove*)a;
+    const EvalMove* y = (const EvalMove*)b;
+    return (y->eval - x->eval); // 降序
+}
+// --- end: root sampling helpers ---
+
 #define MY_PIECES(b)    ((b).board[0])
 #define OPP_PIECES(b)   ((b).board[1])
 #define ALL_PIECES(b)   (MY_PIECES(b) | OPP_PIECES(b))
@@ -29,11 +51,18 @@ typedef struct {
 #define OPP_COUNT(b)    COUNT_BITS(OPP_PIECES(b))
 #define SWAP_BOARD(b) do { u64 t=(b).board[0]; (b).board[0]=(b).board[1]; (b).board[1]=t; } while(0)
 
+// 初始棋型（标准 8x8 开局）：黑子在 (3,4),(4,3)，白子在 (3,3),(4,4)
+#define INIT_BLACK ((1ULL<<28) | (1ULL<<35))
+#define INIT_WHITE ((1ULL<<27) | (1ULL<<36))
+
+int choose_move(uint64_t my_pieces, uint64_t opp_pieces);
+
 // 基础函数
 u64 generate_moves(Board board);
-Board make_move(Board board, int pos);
+Board make_flips(Board board, int pos);
 int solve_endgame(uint64_t my_pieces, uint64_t opp_pieces, int* best_move);
 static inline int final_score(Board b);
+static inline int middle_score(Board b);
 
 // 排序移动相关函数
 static int evaluate_move(Board board, int pos);
@@ -72,7 +101,7 @@ static int perfect_search_pvs(Board board, int empties, int alpha, int beta, boo
     bool first_move = true;
     for (int i = 0; i < move_count; i++) {
         int pos = sorted_moves[i].pos;
-        Board nb = make_move(board, pos);
+        Board nb = make_flips(board, pos);
         SWAP_BOARD(nb);
         
         int val;
@@ -118,7 +147,7 @@ int solve_endgame(uint64_t my_pieces, uint64_t opp_pieces, int* best_move){
 
     for (int i = 0; i < move_count; i++) {
         int pos = sorted_moves[i].pos;
-        Board nb = make_move(board, pos);
+        Board nb = make_flips(board, pos);
         SWAP_BOARD(nb);
         int score = -perfect_search_pvs(nb, empties - 1, -beta, -alpha, true); // 使用PVS
         if (score > best_score){ best_score = score; best_pos = pos; }
@@ -203,7 +232,7 @@ u64 generate_moves(Board board) {
     return moves;
 }
 
-Board make_move(Board board, int pos) {
+Board make_flips(Board board, int pos) {
     u64 my = MY_PIECES(board);
     u64 opp = OPP_PIECES(board);
     u64 opp_inner = opp & 0x7E7E7E7E7E7E7E7EULL;
@@ -294,7 +323,7 @@ static int evaluate_move(Board board, int pos) {
     // 3. 翻转子数量
     u64 my = MY_PIECES(board);
     u64 opp = OPP_PIECES(board);
-    Board test_board = make_move(board, pos);
+    Board test_board = make_flips(board, pos);
     int flips = COUNT_BITS(MY_PIECES(test_board)) - COUNT_BITS(my) - 1;
     return flips * 10;
 }
@@ -328,96 +357,221 @@ static int get_sorted_moves(Board board, u64 moves, ScoredMove *sorted_moves) {
 //     return generate_moves(b);
 // }
 
-int play_to_end(uint64_t black,
-                uint64_t white,
-                uint64_t *final_black,
-                uint64_t *final_white)
-{
-    int empties = 64 - COUNT_BITS(black | white);
-    if (empties > 8) {
-        if (final_black) *final_black = black;
-        if (final_white) *final_white = white;
-        return PLAY_TO_END_SENTINEL;
+#define CORNER_MASK 0x8100000000000081ULL
+
+static int midgame_search(Board board, int depth, int alpha, int beta);
+
+static inline int middle_score(Board b) {
+    // 位置评分表（行优先，idx = r*8 + c）
+    // 角=20；角三邻格=-10；其余边=8；内部=3；空=0（自然不加分）
+    static const int PST[64] = {
+        20, -10,  8,  8,  8,  8, -10, 20,
+       -10, -10,  3,  3,  3,  3, -10,-10,
+         8,   3,  3,  3,  3,  3,   3,  8,
+         8,   3,  3,  3,  3,  3,   3,  8,
+         8,   3,  3,  3,  3,  3,   3,  8,
+         8,   3,  3,  3,  3,  3,   3,  8,
+       -10, -10,  3,  3,  3,  3, -10,-10,
+        20, -10,  8,  8,  8,  8, -10, 20
+    };
+    int myScore = 0, oppScore = 0;
+    // 我方棋盘分（按位枚举）
+    u64 my = MY_PIECES(b);
+    while (my) {
+        int idx = __builtin_ctzll(my);
+        my &= (my - 1);
+        myScore += PST[idx];
     }
-    // 构造以“当前行动方”视角的 Board；初始轮到黑
-    Board board = {{black, white}};
-    bool board0_is_black = true;  // board.board[0] 当前是否表示黑棋
-
-    while (1) {
-        u64 moves = generate_moves(board);
-        if (!moves) {
-            // 检查对手是否也无棋 -> 终局
-            Board opp = board; SWAP_BOARD(opp);
-            u64 opp_moves = generate_moves(opp);
-            if (!opp_moves) break;          // 双无可走 -> 结束
-            board = opp;                    // PASS：交换行动方
-            board0_is_black = !board0_is_black;
-            continue;
-        }
-        // 使用宏 EMPTY_SQUARES 计算剩余空格（只用于防御/调试）
-        int cur_empties = COUNT_BITS(EMPTY_SQUARES(board));
-        if (cur_empties <= 0) break; // 保险退出
-
-        // 选最佳着法（根层也采用 PVS/alpha-beta 策略）
-        ScoredMove sorted_moves[32];
-        int move_count = get_sorted_moves(board, moves, sorted_moves);
-
-        int best_pos   = -1;
-        int best_score = -INT_MAX;
-        int alpha = -INT_MAX;
-        int beta  = INT_MAX;
-        bool first = true;
-
-        for (int i = 0; i < move_count; i++) {
-            int pos = sorted_moves[i].pos;
-            Board nb = make_move(board, pos);
-            SWAP_BOARD(nb); // 下完后轮到对手
-            int val;
-            if (first) {
-                // 第一个全窗口
-                val = -perfect_search_pvs(nb, cur_empties - 1, -beta, -alpha, true);
-                first = false;
-            } else {
-                // Null-window 试探
-                val = -perfect_search_pvs(nb, cur_empties - 1, -alpha - 1, -alpha, false);
-                if (val > alpha && val < beta) {
-                    // 需要重搜
-                    val = -perfect_search_pvs(nb, cur_empties - 1, -beta, -alpha, true);
-                }
-            }
-            if (val > best_score) {
-                best_score = val;
-                best_pos = pos;
-            }
-            if (val > alpha) alpha = val;
-            if (alpha >= beta) break; // 剪枝
-        }
-
-        // 应用找到的最佳走法，推进棋局状态
-        if (best_pos >= 0) {
-            board = make_move(board, best_pos); // 当前方落子
-            SWAP_BOARD(board);                  // 轮到对手（保持 generate_moves 视角一致）
-            board0_is_black = !board0_is_black; // 当前视角颜色翻转
-        } else {
-            // 理论上不应发生：有 moves 却未选出 best_pos
-            break;
-        }
+    // 对方棋盘分
+    u64 opp = OPP_PIECES(b);
+    while (opp) {
+        int idx = __builtin_ctzll(opp);
+        opp &= (opp - 1);
+        oppScore += PST[idx];
     }
-    // 终局统计
-    uint64_t fb, fw;
-    if (board0_is_black) {
-        fb = board.board[0];
-        fw = board.board[1];
+    // 行动力：合法落子数 × 5
+    int myMob = COUNT_BITS(generate_moves(b));
+    Board ob = b; SWAP_BOARD(ob);
+    int oppMob = COUNT_BITS(generate_moves(ob));
+    return (myScore + 5 * myMob) - (oppScore + 5 * oppMob);
+}
+
+// Midgame negamax alpha-beta using middle_score for evaluation.
+static int midgame_search(Board board, int depth, int alpha, int beta) {
+    // Removed early cutoff on empties; only depth==0 triggers evaluation
+    if (depth == 0) {
+        return middle_score(board);
+    }
+    u64 moves = generate_moves(board);
+    if (!moves) {
+        // PASS：尝试对方是否也无棋
+        Board opp = board; SWAP_BOARD(opp);
+        u64 opp_moves = generate_moves(opp);
+        if (!opp_moves) {
+            // 双无可走，局面终结，用终局真实差值
+            return final_score(board);
+        }
+        // 单方无棋：恢复为不减深策略
+        return -midgame_search(opp, depth, -beta, -alpha);
+    }
+    // 着法排序（启发式提高剪枝）
+    ScoredMove sorted_moves[32];
+    int move_count = get_sorted_moves(board, moves, sorted_moves);
+    int best = -INT_MAX;
+    for (int i = 0; i < move_count; ++i) {
+        int pos = sorted_moves[i].pos;
+        Board nb = make_flips(board, pos);
+        SWAP_BOARD(nb); // 轮到对手
+        int val = -midgame_search(nb, depth - 1, -beta, -alpha);
+        if (val > best) best = val;
+        if (val > alpha) alpha = val;
+        if (alpha >= beta) break; // 剪枝
+    }
+    return best;
+}
+
+int choose_move(uint64_t my_pieces, uint64_t opp_pieces) {
+    int empties = 64 - COUNT_BITS(my_pieces | opp_pieces);
+
+    /* Later this script is used for CHASE NN testing, so don't use endgame part */
+    // if (empties <= 16) {
+    //     int best_move = -1;
+    //     solve_endgame(my_pieces, opp_pieces, &best_move);
+    //     return best_move; // 可能为 -1 (PASS)
+    // }
+
+    Board board = (Board){{my_pieces, opp_pieces}};
+    u64 moves = generate_moves(board);
+    if (!moves) return -1; // PASS
+
+    // 黑方第一步：初始布局时，4 个中心对称着法中等概率随机选择
+    if (MY_PIECES(board) == INIT_BLACK && OPP_PIECES(board) == INIT_WHITE) {
+        int cand[4]; int m = 0;
+        u64 t = moves;
+        while (t) {
+            int pos = __builtin_ctzll(t);
+            t &= (t - 1);
+            if (m < 4) cand[m++] = pos;
+        }
+        if (m > 0) {
+            int pick = (int)(rng_double01() * m);
+            if (pick >= m) pick = m - 1;
+            return cand[pick];
+        }
+        // 理论上不会走到这里，兜底继续后续逻辑
+    }
+
+    // 先对所有合法手做中局搜索评分
+    ScoredMove sorted_moves[32];
+    int move_count = get_sorted_moves(board, moves, sorted_moves);
+    if (move_count <= 0) return -1;
+
+    EvalMove evals[32];
+    int best_idx = 0;
+    int best_val = -INT_MAX;
+
+    for (int i = 0; i < move_count; ++i) {
+        int pos = sorted_moves[i].pos;
+        Board nb = make_flips(board, pos);
+        SWAP_BOARD(nb);
+        int val = -midgame_search(nb, MIDGAME_DEPTH - 1, -INT_MAX, INT_MAX);
+        evals[i].pos = pos;
+        evals[i].eval = val;
+        if (val > best_val) { best_val = val; best_idx = i; }
+    }
+
+    // 只有 1 手可走：直接返回
+    if (move_count <= 1) {
+        return evals[best_idx].pos;
+    }
+
+    // 按真实搜索得分降序排序
+    qsort(evals, move_count, sizeof(EvalMove), compare_eval_desc);
+
+    // 大差距保护：最优明显领先时不随机
+    const int HARD_MARGIN = 16;
+    if (move_count >= 2 && (evals[0].eval - evals[1].eval) >= HARD_MARGIN) {
+        return evals[0].pos;
+    }
+
+    // 仅在 Top-3 内做“硬比例”采样（不再使用温度/softmax）
+    int k = (move_count < 3) ? move_count : 3;
+
+    // 开局 vs 中后期的固定比例（相对权重）
+    double w[3] = {0};
+    if (empties >= 44) {
+        // 开局：8 : 1.5 : 0.5
+        w[0] = 8.0; w[1] = (k >= 2 ? 1.5 : 0.0); w[2] = (k >= 3 ? 0.5 : 0.0);
     } else {
-        fb = board.board[1];
-        fw = board.board[0];
+        // 中后期：9 : 0.7 : 0.3
+        w[0] = 9.0; w[1] = (k >= 2 ? 0.7 : 0.0); w[2] = (k >= 3 ? 0.3 : 0.0);
     }
-    if (final_black) *final_black = fb;
-    if (final_white) *final_white = fw;
 
-    int black_cnt = COUNT_BITS(fb);
-    int white_cnt = COUNT_BITS(fw);
-    if (black_cnt > white_cnt) return 1;
-    if (black_cnt < white_cnt) return -1;
+    double wsum = 0.0;
+    for (int i = 0; i < k; ++i) wsum += w[i];
+    if (wsum <= 0.0) return evals[0].pos; // 兜底
+
+    // 采样
+    double u = rng_double01() * wsum;
+    double acc = 0.0;
+    int pick = 0;
+    for (int i = 0; i < k; ++i) {
+        acc += w[i];
+        if (u <= acc) { pick = i; break; }
+    }
+    return evals[pick].pos;
+}
+
+// ---------------- Wrapper for project interface ----------------
+// makeMove: required external interface. Converts 2D char board to bitboards, calls engine, returns chosen move.
+// Signature MUST stay identical to legacy bots.
+int makeMove(const char board[][26], int n, char turn, int *row, int *col) {
+    if (n != 8) {
+        // Simple fallback: scan for first legal move (8-direction Othello rule)
+        int dr[8] = {-1,-1,-1,0,0,1,1,1};
+        int dc[8] = {-1,0,1,-1,1,-1,0,1};
+        char me = turn;
+        char opp = (turn == 'B') ? 'W' : 'B';
+        for (int r = 0; r < n; ++r) {
+            for (int c = 0; c < n; ++c) {
+                if (board[r][c] != '.' && board[r][c] != 'U' && board[r][c] != 'u') continue;
+                int legal = 0;
+                for (int k = 0; k < 8 && !legal; ++k) {
+                    int rr = r + dr[k], cc = c + dc[k];
+                    int seen = 0;
+                    while (rr >=0 && rr < n && cc >=0 && cc < n && board[rr][cc] == opp) { rr+=dr[k]; cc+=dc[k]; seen=1; }
+                    if (seen && rr>=0 && rr<n && cc>=0 && cc<n && board[rr][cc]==me) legal = 1;
+                }
+                if (legal) { if (row) *row = r; if (col) *col = c; return 0; }
+            }
+        }
+        return -1; // no move
+    }
+    // Bitboard conversion for 8x8
+    uint64_t my = 0ULL, opp = 0ULL;
+    if (turn == 'B') {
+        for (int r = 0; r < 8; ++r) {
+            for (int c = 0; c < 8; ++c) {
+                char ch = board[r][c];
+                int idx = r*8 + c; // mapping: (r,c) -> bit idx
+                if (ch == 'B' || ch == 'b') my |= (1ULL << idx);
+                else if (ch == 'W' || ch == 'w') opp |= (1ULL << idx);
+            }
+        }
+    } else { // turn == 'W'
+        for (int r = 0; r < 8; ++r) {
+            for (int c = 0; c < 8; ++c) {
+                char ch = board[r][c];
+                int idx = r*8 + c;
+                if (ch == 'W' || ch == 'w') my |= (1ULL << idx);
+                else if (ch == 'B' || ch == 'b') opp |= (1ULL << idx);
+            }
+        }
+    }
+    int pos = choose_move(my, opp); // -1 means PASS
+    if (pos < 0) return -1;
+    if (row) *row = pos / 8;
+    if (col) *col = pos % 8;
     return 0;
 }
+// ---------------- End wrapper ----------------

@@ -328,20 +328,24 @@ static int get_sorted_moves(Board board, u64 moves, ScoredMove *sorted_moves) {
 //     return generate_moves(b);
 // }
 
-int play_to_end(uint64_t black,
-                uint64_t white,
-                uint64_t *final_black,
-                uint64_t *final_white)
+// 新语义：play_to_end(my, opp, &final_my, &final_opp)
+// - 输入 my/opp：my 始终为“当前准备走子一方”的棋盘，opp 为对方
+// - 输出 final_my/final_opp：按相同语义返回终局棋盘（初始 my 一方的最终棋盘，初始 opp 一方的最终棋盘）
+// - 返回值：>0 表示 my 获胜，<0 表示 opp 获胜，0 表示平局；当不处理（如空位>8）时返回 PLAY_TO_END_SENTINEL
+int play_to_end(uint64_t my,
+                uint64_t opp,
+                uint64_t *final_my,
+                uint64_t *final_opp)
 {
-    int empties = 64 - COUNT_BITS(black | white);
+    int empties = 64 - COUNT_BITS(my | opp);
     if (empties > 8) {
-        if (final_black) *final_black = black;
-        if (final_white) *final_white = white;
+        if (final_my)  *final_my  = my;
+        if (final_opp) *final_opp = opp;
         return PLAY_TO_END_SENTINEL;
     }
-    // 构造以“当前行动方”视角的 Board；初始轮到黑
-    Board board = {{black, white}};
-    bool board0_is_black = true;  // board.board[0] 当前是否表示黑棋
+    // 构造以“当前行动方”视角的 Board；初始轮到 my
+    Board board = {{my, opp}};
+    bool board0_is_my = true;  // board.board[0] 当前是否表示初始 my 方
 
     while (1) {
         u64 moves = generate_moves(board);
@@ -351,7 +355,7 @@ int play_to_end(uint64_t black,
             u64 opp_moves = generate_moves(opp);
             if (!opp_moves) break;          // 双无可走 -> 结束
             board = opp;                    // PASS：交换行动方
-            board0_is_black = !board0_is_black;
+            board0_is_my = !board0_is_my;
             continue;
         }
         // 使用宏 EMPTY_SQUARES 计算剩余空格（只用于防御/调试）
@@ -397,27 +401,27 @@ int play_to_end(uint64_t black,
         if (best_pos >= 0) {
             board = make_move(board, best_pos); // 当前方落子
             SWAP_BOARD(board);                  // 轮到对手（保持 generate_moves 视角一致）
-            board0_is_black = !board0_is_black; // 当前视角颜色翻转
+            board0_is_my = !board0_is_my;       // 当前视角标识翻转
         } else {
             // 理论上不应发生：有 moves 却未选出 best_pos
             break;
         }
     }
-    // 终局统计
-    uint64_t fb, fw;
-    if (board0_is_black) {
-        fb = board.board[0];
-        fw = board.board[1];
+    // 终局统计（按初始 my/opp 标签返回）
+    uint64_t fmy, fopp;
+    if (board0_is_my) {
+        fmy  = board.board[0];
+        fopp = board.board[1];
     } else {
-        fb = board.board[1];
-        fw = board.board[0];
+        fmy  = board.board[1];
+        fopp = board.board[0];
     }
-    if (final_black) *final_black = fb;
-    if (final_white) *final_white = fw;
+    if (final_my)  *final_my  = fmy;
+    if (final_opp) *final_opp = fopp;
 
-    int black_cnt = COUNT_BITS(fb);
-    int white_cnt = COUNT_BITS(fw);
-    if (black_cnt > white_cnt) return 1;
-    if (black_cnt < white_cnt) return -1;
+    int my_cnt  = COUNT_BITS(fmy);
+    int opp_cnt = COUNT_BITS(fopp);
+    if (my_cnt > opp_cnt) return 1;
+    if (my_cnt < opp_cnt) return -1;
     return 0;
 }

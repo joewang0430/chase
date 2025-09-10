@@ -26,6 +26,8 @@ PASS_INDEX = 64
 BOARD_MASK = (1 << 64) - 1
 INIT_BLACK = 0x0000000810000000
 INIT_WHITE = 0x0000001008000000
+# C 端哨兵返回值：仅在空位>8时返回；≤8 时应给出终局
+PLAY_TO_END_SENTINEL = -1073741824  # INT_MIN/2
 
 # 终局库加载
 class EndgameLib:
@@ -40,10 +42,23 @@ class EndgameLib:
         if not os.path.exists(so_path):
             return
         lib = ctypes.CDLL(so_path)
+        # 新语义：play_to_end(my, opp, &final_my, &final_opp)
         lib.play_to_end.argtypes = [c_uint64, c_uint64, POINTER(c_uint64), POINTER(c_uint64)]
         lib.play_to_end.restype = c_int
         self.lib = lib
         self.play_to_end = lib.play_to_end
+
+    def solve_myopp(self, my: int, opp: int):
+        """按 my/opp 语义调用收官，返回 (ok, final_my, final_opp)。"""
+        if self.play_to_end is None:
+            return False, my, opp
+        out_my = c_uint64(0)
+        out_opp = c_uint64(0)
+        res = self.play_to_end(c_uint64(my), c_uint64(opp), byref(out_my), byref(out_opp))
+        fmy, fopp = out_my.value, out_opp.value
+        # 成功判定：返回值不是哨兵，即接受该终局（即便盘面未占满 64 格）
+        ok = (res != PLAY_TO_END_SENTINEL)
+        return ok, fmy, fopp
 
 END_LIB = EndgameLib()
 
@@ -132,6 +147,15 @@ def finish_with_endgame_safe(black: int, white: int, side_black_to_move: bool):
             # t1=最终白，t2=最终黑
             return True, t2.value, t1.value
         return False, black, white
+
+def finish_with_endgame_myopp(black: int, white: int, side_black_to_move: bool):
+    """使用 my/opp 语义的统一收官调用。返回 (ok, final_black, final_white)。"""
+    if side_black_to_move:
+        ok, fmy, fopp = END_LIB.solve_myopp(black, white)
+        return ok, fmy, fopp
+    else:
+        ok, fmy, fopp = END_LIB.solve_myopp(white, black)
+        return ok, fopp, fmy
 
 def true_score_for_nn(nn_is_black: bool, final_black: int, final_white: int) -> int:
     """
@@ -241,38 +265,13 @@ def play_one_game(nn_policy: NNPolicy, engine, nn_is_black: bool, rng: random.Ra
             raw_ply += 1
             continue
 
-        # 进入残局：双方交给枚举（仅当 safe 成功时才直接终结对局）
+        # 进入残局：双方交给枚举（优先用统一的 my/opp 语义；失败则继续对弈）
         if empties <= 8:
-            if check_end_bias:
-                # 对比 naive 与 safe（naive 仅用于检测，不用于落地）
-                naive_b, naive_w = finish_with_endgame_naive(black, white)
-                ok, safe_b, safe_w = finish_with_endgame_safe(black, white, side_black_to_move)
-                if end_bias_counters is not None:
-                    end_bias_counters['samples'] = end_bias_counters.get('samples', 0) + 1
-                    if (naive_b != safe_b) or (naive_w != safe_w):
-                        end_bias_counters['mismatch'] = end_bias_counters.get('mismatch', 0) + 1
-                        # 判断是否更利于进入残局前的领先方
-                        pre_b = popcount(black); pre_w = popcount(white)
-                        leader = 1 if pre_b > pre_w else (-1 if pre_w > pre_b else 0)  # 1=黑领先, -1=白领先
-                        naive_margin = popcount(naive_b) - popcount(naive_w)  # >0 黑优
-                        safe_margin = popcount(safe_b) - popcount(safe_w)
-                        delta = naive_margin - safe_margin
-                        favors = (leader == 1 and delta > 0) or (leader == -1 and delta < 0)
-                        if favors:
-                            end_bias_counters['favors_leader'] = end_bias_counters.get('favors_leader', 0) + 1
-                        # 可选：打印详细记录
-                        print(f'[end-bias] empties={empties}, side_black_to_move={side_black_to_move}, '
-                              f'pre_leader={"B" if leader==1 else ("W" if leader==-1 else "T")}, '
-                              f'naive_margin={naive_margin}, safe_margin={safe_margin}')
-                # 仅当 safe 成功时终结；否则继续常规走子
-                if ok:
-                    black, white = safe_b, safe_w
-                    break
-            else:
-                ok, safe_b, safe_w = finish_with_endgame_safe(black, white, side_black_to_move)
-                if ok:
-                    black, white = safe_b, safe_w
-                    break
+            # 统一路径
+            ok, fb, fw = finish_with_endgame_myopp(black, white, side_black_to_move)
+            if ok:
+                black, white = fb, fw
+                break
 
         # 决策
         if side_black_to_move == nn_is_black:
@@ -282,10 +281,14 @@ def play_one_game(nn_policy: NNPolicy, engine, nn_is_black: bool, rng: random.Ra
             else:
                 mv = nn_policy.choose_move(my, opp, ai)
         else:
-            if engine == 'greedy':
-                mv = greedy_choose(my, opp)
+            # 对手：若为整盘第一手（黑方首手）且对手是 greedy，则脚本代为 4 选 1 随机
+            if raw_ply == 0 and side_black_to_move and engine == 'greedy':
+                mv = random_black_first_move(ai, black, white, rng)
             else:
-                mv = engine.choose_move(my, opp)
+                if engine == 'greedy':
+                    mv = greedy_choose(my, opp)
+                else:
+                    mv = engine.choose_move(my, opp)
 
         # 应用
         if mv == PASS_INDEX:

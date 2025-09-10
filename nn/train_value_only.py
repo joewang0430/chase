@@ -151,7 +151,7 @@ def main():
     ap.add_argument('--epochs', type=int, default=5)
     ap.add_argument('--batch-size', type=int, default=128)
     ap.add_argument('--lr', type=float, default=1e-3)
-    ap.add_argument('--lr-step', type=int, default=4)
+    ap.add_argument('--lr-step', type=int, default=5)
     ap.add_argument('--val-ratio', type=float, default=0.1)
     ap.add_argument('--min-empties', type=int, default=9)
     ap.add_argument('--out-dir', type=str, default='models')

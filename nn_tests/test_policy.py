@@ -98,16 +98,40 @@ def random_black_first_move(ai: OthelloAI, black: int, white: int, rng: random.R
         return PASS_INDEX
     return rng.choice(moves)
 
-def finish_with_endgame(black: int, white: int):
-    """调用 ending_mac.so 的 play_to_end 完成残局（empties<=8）。失败则降级返回当前局面。"""
+def finish_with_endgame_naive(black: int, white: int):
+    """不区分待走方的原始调用（用于对比检测）。"""
     occ = (black | white) & BOARD_MASK
     empties = 64 - popcount(occ)
     if empties == 0 or END_LIB.play_to_end is None:
         return black, white
     fb = c_uint64(0); fw = c_uint64(0)
     res = END_LIB.play_to_end(c_uint64(black), c_uint64(white), byref(fb), byref(fw))
-    # 当库因为阈值返回哨兵或异常，这里仍然使用当前局面
     return (fb.value or black), (fw.value or white)
+
+def finish_with_endgame_safe(black: int, white: int, side_black_to_move: bool):
+    """
+    区分待走方的安全调用：
+    - 若轮到黑走：按 (black, white) 调用，输出即为最终 (black, white)
+    - 若轮到白走：按 (white, black) 调用，再将输出交换回 (black, white)
+    返回 (ok, final_black, final_white)
+    """
+    occ = (black | white) & BOARD_MASK
+    empties = 64 - popcount(occ)
+    if empties == 0 or END_LIB.play_to_end is None:
+        return False, black, white
+    if side_black_to_move:
+        fb = c_uint64(0); fw = c_uint64(0)
+        res = END_LIB.play_to_end(c_uint64(black), c_uint64(white), byref(fb), byref(fw))
+        if res:
+            return True, fb.value, fw.value
+        return False, black, white
+    else:
+        t1 = c_uint64(0); t2 = c_uint64(0)
+        res = END_LIB.play_to_end(c_uint64(white), c_uint64(black), byref(t1), byref(t2))
+        if res:
+            # t1=最终白，t2=最终黑
+            return True, t2.value, t1.value
+        return False, black, white
 
 def true_score_for_nn(nn_is_black: bool, final_black: int, final_white: int) -> int:
     """
@@ -185,7 +209,8 @@ class Stats:
     def avg_true(self):
         return (self.sum_true / self.n) if self.n else 0.0
 
-def play_one_game(nn_policy: NNPolicy, engine, nn_is_black: bool, rng: random.Random):
+def play_one_game(nn_policy: NNPolicy, engine, nn_is_black: bool, rng: random.Random,
+                  check_end_bias: bool = False, end_bias_counters: dict | None = None):
     """
     engine: CEngine 或字符串 'greedy'
     返回 (final_black, final_white)
@@ -216,10 +241,38 @@ def play_one_game(nn_policy: NNPolicy, engine, nn_is_black: bool, rng: random.Ra
             raw_ply += 1
             continue
 
-        # 进入残局：双方交给枚举
+        # 进入残局：双方交给枚举（仅当 safe 成功时才直接终结对局）
         if empties <= 8:
-            black, white = finish_with_endgame(black, white)
-            break
+            if check_end_bias:
+                # 对比 naive 与 safe（naive 仅用于检测，不用于落地）
+                naive_b, naive_w = finish_with_endgame_naive(black, white)
+                ok, safe_b, safe_w = finish_with_endgame_safe(black, white, side_black_to_move)
+                if end_bias_counters is not None:
+                    end_bias_counters['samples'] = end_bias_counters.get('samples', 0) + 1
+                    if (naive_b != safe_b) or (naive_w != safe_w):
+                        end_bias_counters['mismatch'] = end_bias_counters.get('mismatch', 0) + 1
+                        # 判断是否更利于进入残局前的领先方
+                        pre_b = popcount(black); pre_w = popcount(white)
+                        leader = 1 if pre_b > pre_w else (-1 if pre_w > pre_b else 0)  # 1=黑领先, -1=白领先
+                        naive_margin = popcount(naive_b) - popcount(naive_w)  # >0 黑优
+                        safe_margin = popcount(safe_b) - popcount(safe_w)
+                        delta = naive_margin - safe_margin
+                        favors = (leader == 1 and delta > 0) or (leader == -1 and delta < 0)
+                        if favors:
+                            end_bias_counters['favors_leader'] = end_bias_counters.get('favors_leader', 0) + 1
+                        # 可选：打印详细记录
+                        print(f'[end-bias] empties={empties}, side_black_to_move={side_black_to_move}, '
+                              f'pre_leader={"B" if leader==1 else ("W" if leader==-1 else "T")}, '
+                              f'naive_margin={naive_margin}, safe_margin={safe_margin}')
+                # 仅当 safe 成功时终结；否则继续常规走子
+                if ok:
+                    black, white = safe_b, safe_w
+                    break
+            else:
+                ok, safe_b, safe_w = finish_with_endgame_safe(black, white, side_black_to_move)
+                if ok:
+                    black, white = safe_b, safe_w
+                    break
 
         # 决策
         if side_black_to_move == nn_is_black:
@@ -257,6 +310,7 @@ def main():
     ap.add_argument('--model', type=str, default=None, help='NN 权重路径（可选）')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--games-per-opponent', type=int, default=200)
+    ap.add_argument('--check-end-bias', action='store_true', help='检测残局收尾 naive/safe 差异与是否偏向领先一方')
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -265,6 +319,7 @@ def main():
 
     device = torch.device('mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu'))
     nn_policy = NNPolicy(args.model, device)
+    end_bias_counters = {} if args.check_end_bias else None
 
     # 四个 C 引擎
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -288,11 +343,13 @@ def main():
         st_white = Stats()
         # 黑方 100
         for i in range(args.games_per_opponent // 2):
-            fb, fw = play_one_game(nn_policy, eng, nn_is_black=True, rng=random)
+            fb, fw = play_one_game(nn_policy, eng, nn_is_black=True, rng=random,
+                                   check_end_bias=args.check_end_bias, end_bias_counters=end_bias_counters)
             st_black.add(fb, fw, nn_is_black=True)
         # 白方 100
         for i in range(args.games_per_opponent // 2):
-            fb, fw = play_one_game(nn_policy, eng, nn_is_black=False, rng=random)
+            fb, fw = play_one_game(nn_policy, eng, nn_is_black=False, rng=random,
+                                   check_end_bias=args.check_end_bias, end_bias_counters=end_bias_counters)
             st_white.add(fb, fw, nn_is_black=False)
 
         st_all = Stats()
@@ -318,16 +375,33 @@ def main():
     print('\n=== OVERALL (4 opponents) ===')
     print(f'Total 800: W/D/L = {total_stats.w}/{total_stats.d}/{total_stats.l} out of {total_stats.n}, avg true = {total_stats.avg_true():.3f}')
 
-    # 另外：与 greedy 基线 2 局（不计入总计）
-    print('\n=== VS greedy (2 games) ===')
-    fb, fw = play_one_game(nn_policy, 'greedy', nn_is_black=True, rng=random)
-    ts_black = true_score_for_nn(True, fb, fw)
-    res_black = outcome_for_nn(True, fb, fw)
-    fb2, fw2 = play_one_game(nn_policy, 'greedy', nn_is_black=False, rng=random)
-    ts_white = true_score_for_nn(False, fb2, fw2)
-    res_white = outcome_for_nn(False, fb2, fw2)
-    print(f'NN (Black) vs greedy: result={res_black}, true={ts_black:+d}')
-    print(f'NN (White) vs greedy: result={res_white}, true={ts_white:+d}')
+    # 另外：与 greedy 基线 30 局（默认；不计入总计），黑白各 15
+    print('\n=== VS greedy (30 games) ===')
+    greedy_games = 30
+    g_black = Stats(); g_white = Stats()
+    for _ in range(greedy_games // 2):
+        fb, fw = play_one_game(nn_policy, 'greedy', nn_is_black=True, rng=random,
+                               check_end_bias=args.check_end_bias, end_bias_counters=end_bias_counters)
+        g_black.add(fb, fw, nn_is_black=True)
+    for _ in range(greedy_games // 2):
+        fb, fw = play_one_game(nn_policy, 'greedy', nn_is_black=False, rng=random,
+                               check_end_bias=args.check_end_bias, end_bias_counters=end_bias_counters)
+        g_white.add(fb, fw, nn_is_black=False)
+    g_all = Stats()
+    g_all.w = g_black.w + g_white.w
+    g_all.d = g_black.d + g_white.d
+    g_all.l = g_black.l + g_white.l
+    g_all.sum_true = g_black.sum_true + g_white.sum_true
+    g_all.n = g_black.n + g_white.n
+
+    if args.check_end_bias and end_bias_counters:
+        s = end_bias_counters.get('samples', 0)
+        m = end_bias_counters.get('mismatch', 0)
+        f = end_bias_counters.get('favors_leader', 0)
+        print(f'\n[end-bias summary] samples={s}, naive_vs_safe_mismatch={m}, favor_leader_in_mismatch={f}')
+    print(f'NN as Black vs greedy: W/D/L = {g_black.w}/{g_black.d}/{g_black.l} out of {g_black.n}, avg true = {g_black.avg_true():.3f}')
+    print(f'NN as White vs greedy: W/D/L = {g_white.w}/{g_white.d}/{g_white.l} out of {g_white.n}, avg true = {g_white.avg_true():.3f}')
+    print(f'Overall vs greedy:     W/D/L = {g_all.w}/{g_all.d}/{g_all.l} out of {g_all.n}, avg true = {g_all.avg_true():.3f}')
 
     # 详细逐对手汇总（可选 JSON）
     summary = {
@@ -341,8 +415,9 @@ def main():
         },
         'overall_800': {'W': total_stats.w, 'D': total_stats.d, 'L': total_stats.l, 'avg_true': round(total_stats.avg_true(), 3)},
         'greedy': {
-            'nn_black': {'result': res_black, 'true': ts_black},
-            'nn_white': {'result': res_white, 'true': ts_white}
+            'black': {'W': g_black.w, 'D': g_black.d, 'L': g_black.l, 'avg_true': round(g_black.avg_true(), 3)},
+            'white': {'W': g_white.w, 'D': g_white.d, 'L': g_white.l, 'avg_true': round(g_white.avg_true(), 3)},
+            'overall': {'W': g_all.w, 'D': g_all.d, 'L': g_all.l, 'avg_true': round(g_all.avg_true(), 3)}
         }
     }
     print('\nSUMMARY JSON:')

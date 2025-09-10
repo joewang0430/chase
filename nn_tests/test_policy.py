@@ -126,6 +126,16 @@ def true_score_for_nn(nn_is_black: bool, final_black: int, final_white: int) -> 
         # 平局
         return 0
 
+def outcome_for_nn(nn_is_black: bool, final_black: int, final_white: int) -> str:
+    """
+    返回单局结果：'W'（胜）/'D'（平）/'L'（负）
+    判定只看棋子数大小（不含空格）。
+    """
+    b = popcount(final_black); w = popcount(final_white)
+    if b == w:
+        return 'D'
+    return 'W' if ((b > w) == nn_is_black) else 'L'
+
 class NNPolicy:
     def __init__(self, model_path: str | None, device: torch.device):
         self.device = device
@@ -309,13 +319,15 @@ def main():
     print(f'Total 800: W/D/L = {total_stats.w}/{total_stats.d}/{total_stats.l} out of {total_stats.n}, avg true = {total_stats.avg_true():.3f}')
 
     # 另外：与 greedy 基线 2 局（不计入总计）
-    print('\n=== VS greedy (2 games, report true score only) ===')
+    print('\n=== VS greedy (2 games) ===')
     fb, fw = play_one_game(nn_policy, 'greedy', nn_is_black=True, rng=random)
     ts_black = true_score_for_nn(True, fb, fw)
+    res_black = outcome_for_nn(True, fb, fw)
     fb2, fw2 = play_one_game(nn_policy, 'greedy', nn_is_black=False, rng=random)
     ts_white = true_score_for_nn(False, fb2, fw2)
-    print(f'NN (Black) vs greedy true score = {ts_black:+d}')
-    print(f'NN (White) vs greedy true score = {ts_white:+d}')
+    res_white = outcome_for_nn(False, fb2, fw2)
+    print(f'NN (Black) vs greedy: result={res_black}, true={ts_black:+d}')
+    print(f'NN (White) vs greedy: result={res_white}, true={ts_white:+d}')
 
     # 详细逐对手汇总（可选 JSON）
     summary = {
@@ -328,7 +340,10 @@ def main():
             for name, (st_b, st_w, st_all) in per_engine_results.items()
         },
         'overall_800': {'W': total_stats.w, 'D': total_stats.d, 'L': total_stats.l, 'avg_true': round(total_stats.avg_true(), 3)},
-        'greedy': {'nn_black_true': ts_black, 'nn_white_true': ts_white}
+        'greedy': {
+            'nn_black': {'result': res_black, 'true': ts_black},
+            'nn_white': {'result': res_white, 'true': ts_white}
+        }
     }
     print('\nSUMMARY JSON:')
     print(json.dumps(summary, ensure_ascii=False, indent=2))

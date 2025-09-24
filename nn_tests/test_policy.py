@@ -1,3 +1,5 @@
+# PYTHONPATH=. python3 nn_tests/test_policy.py --model models/chase.pt --seed 42 --games-per-opponent 200
+
 import os
 import sys
 import argparse

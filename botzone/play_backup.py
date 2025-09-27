@@ -10,13 +10,6 @@ import random
 POPCNT8 = [bin(i).count('1') for i in range(256)]
 ENDING_SO_NAME = "ending.so"
 
-# --------------- 全局位棋盘常量与基础函数（从 OthelloAI 中抽出便于复用） ---------------
-FILE_A       = 0x0101010101010101
-FILE_H       = 0x8080808080808080
-NOT_FILE_A   = 0xFFFFFFFFFFFFFFFF ^ FILE_A
-NOT_FILE_H   = 0xFFFFFFFFFFFFFFFF ^ FILE_H
-FULL_MASK    = 0xFFFFFFFFFFFFFFFF
-
 def popcount(x: int) -> int:
     c = 0
     while x:
@@ -24,134 +17,18 @@ def popcount(x: int) -> int:
         x >>= 8
     return c
 
-# 坐标转换顶层函数（统一风格）
-def xy_to_bit(x: int, y: int) -> int:
-    return x * 8 + y
-
-def bit_to_xy(bit_pos: int):
-    return bit_pos // 8, bit_pos % 8
-
-def set_bit(bitboard: int, x: int, y: int) -> int:
-    return bitboard | (1 << (x * 8 + y))
-
-# 位移操作（不绑定实例，纯函数）
-def shift_e (bb: int) -> int: return (bb & NOT_FILE_H) << 1 & FULL_MASK
-def shift_w (bb: int) -> int: return (bb & NOT_FILE_A) >> 1
-def shift_n (bb: int) -> int: return bb >> 8
-def shift_s (bb: int) -> int: return (bb << 8) & FULL_MASK
-def shift_ne(bb: int) -> int: return (bb & NOT_FILE_H) >> 7
-def shift_nw(bb: int) -> int: return (bb & NOT_FILE_A) >> 9
-def shift_se(bb: int) -> int: return ((bb & NOT_FILE_H) << 9) & FULL_MASK
-def shift_sw(bb: int) -> int: return ((bb & NOT_FILE_A) << 7) & FULL_MASK
-
-def legal_moves(me: int, opp: int) -> int:
-    """生成 me 的合法着点位棋盘（位=1 表示可落子）。"""
-    empty = ~(me | opp) & FULL_MASK
-    if empty == 0:
-        return 0
-    moves = 0
-    # East
-    x = shift_e(me) & opp; acc = 0
-    while x:
-        nxt = shift_e(x); acc |= nxt; x = nxt & opp
-    moves |= acc & empty
-    # West
-    x = shift_w(me) & opp; acc = 0
-    while x:
-        nxt = shift_w(x); acc |= nxt; x = nxt & opp
-    moves |= acc & empty
-    # North
-    x = shift_n(me) & opp; acc = 0
-    while x:
-        nxt = shift_n(x); acc |= nxt; x = nxt & opp
-    moves |= acc & empty
-    # South
-    x = shift_s(me) & opp; acc = 0
-    while x:
-        nxt = shift_s(x); acc |= nxt; x = nxt & opp
-    moves |= acc & empty
-    # NE
-    x = shift_ne(me) & opp; acc = 0
-    while x:
-        nxt = shift_ne(x); acc |= nxt; x = nxt & opp
-    moves |= acc & empty
-    # NW
-    x = shift_nw(me) & opp; acc = 0
-    while x:
-        nxt = shift_nw(x); acc |= nxt; x = nxt & opp
-    moves |= acc & empty
-    # SE
-    x = shift_se(me) & opp; acc = 0
-    while x:
-        nxt = shift_se(x); acc |= nxt; x = nxt & opp
-    moves |= acc & empty
-    # SW
-    x = shift_sw(me) & opp; acc = 0
-    while x:
-        nxt = shift_sw(x); acc |= nxt; x = nxt & opp
-    moves |= acc & empty
-    return moves
-
-def apply_move(me: int, opp: int, pos: int):
-    """对 me 在坐标 pos (0..63) 落子；返回 (new_me, new_opp)。pos<0 表示 PASS（交换走子方）。"""
-    if pos < 0:
-        return opp, me  # pass：交换
-    move_bit = 1 << pos
-    if (me | opp) & move_bit:
-        return me, opp  # 非法/已占；原样返回（调用方可选择忽略）
-    flips = 0
-    # East
-    cur = shift_e(move_bit); line = 0
-    while cur & opp:
-        line |= cur; cur = shift_e(cur)
-    if cur & me: flips |= line
-    # West
-    cur = shift_w(move_bit); line = 0
-    while cur & opp:
-        line |= cur; cur = shift_w(cur)
-    if cur & me: flips |= line
-    # North
-    cur = shift_n(move_bit); line = 0
-    while cur & opp:
-        line |= cur; cur = shift_n(cur)
-    if cur & me: flips |= line
-    # South
-    cur = shift_s(move_bit); line = 0
-    while cur & opp:
-        line |= cur; cur = shift_s(cur)
-    if cur & me: flips |= line
-    # NE
-    cur = shift_ne(move_bit); line = 0
-    while cur & opp:
-        line |= cur; cur = shift_ne(cur)
-    if cur & me: flips |= line
-    # NW
-    cur = shift_nw(move_bit); line = 0
-    while cur & opp:
-        line |= cur; cur = shift_nw(cur)
-    if cur & me: flips |= line
-    # SE
-    cur = shift_se(move_bit); line = 0
-    while cur & opp:
-        line |= cur; cur = shift_se(cur)
-    if cur & me: flips |= line
-    # SW
-    cur = shift_sw(move_bit); line = 0
-    while cur & opp:
-        line |= cur; cur = shift_sw(cur)
-    if cur & me: flips |= line
-    if flips == 0:
-        return me, opp  # 无翻子：非法位置，忽略
-    me |= move_bit | flips
-    opp &= ~flips
-    return me, opp
-
 # Removed numpy; use pure Python integers for bitboards.
 class OthelloAI:
     def __init__(self):
         self.my_pieces = 0
         self.opp_pieces = 0
         self.my_color = 1
+        # Masks
+        self.FILE_A = 0x0101010101010101
+        self.FILE_H = 0x8080808080808080
+        self.NOT_FILE_A = 0xFFFFFFFFFFFFFFFF ^ self.FILE_A
+        self.NOT_FILE_H = 0xFFFFFFFFFFFFFFFF ^ self.FILE_H
+        self.FULL_MASK = 0xFFFFFFFFFFFFFFFF
         # --- Endgame solver handles ---
         self.endgame_lib = None
         self.endgame_fn = None
@@ -164,19 +41,147 @@ class OthelloAI:
         self.endgame_error = None  # 记录 ctypes 加载 / 调用失败原因
 
     # --- 坐标与位操作 ---
-    # bit_to_xy / set_bit 已抽到模块级函数
+    def xy_to_bit(self, x, y):
+        return x * 8 + y
+    def bit_to_xy(self, bit_pos):
+        return bit_pos // 8, bit_pos % 8
+    def set_bit(self, bitboard, x, y):
+        return bitboard | (1 << (x * 8 + y))
 
     # --- 初始棋盘 ---
     def init_standard_board(self, my_color):
         self.my_color = my_color
         if my_color == 1:  # 黑方
-            self.my_pieces = set_bit(0, 3, 4) | set_bit(0, 4, 3)
-            self.opp_pieces = set_bit(0, 3, 3) | set_bit(0, 4, 4)
+            self.my_pieces = self.set_bit(0, 3, 4) | self.set_bit(0, 4, 3)
+            self.opp_pieces = self.set_bit(0, 3, 3) | self.set_bit(0, 4, 4)
         else:  # 白方
-            self.my_pieces = set_bit(0, 3, 3) | set_bit(0, 4, 4)
-            self.opp_pieces = set_bit(0, 3, 4) | set_bit(0, 4, 3)
+            self.my_pieces = self.set_bit(0, 3, 3) | self.set_bit(0, 4, 4)
+            self.opp_pieces = self.set_bit(0, 3, 4) | self.set_bit(0, 4, 3)
 
-    # （位移 / 合法着点 / 落子 已抽取为模块级函数）
+    # --- 位移函数 ---
+    def _shift_e (self, bb): return (bb & self.NOT_FILE_H) << 1 & self.FULL_MASK
+    def _shift_w (self, bb): return (bb & self.NOT_FILE_A) >> 1
+    def _shift_n (self, bb): return bb >> 8
+    def _shift_s (self, bb): return (bb << 8) & self.FULL_MASK
+    def _shift_ne(self, bb): return (bb & self.NOT_FILE_H) >> 7
+    def _shift_nw(self, bb): return (bb & self.NOT_FILE_A) >> 9
+    def _shift_se(self, bb): return ((bb & self.NOT_FILE_H) << 9) & self.FULL_MASK
+    def _shift_sw(self, bb): return ((bb & self.NOT_FILE_A) << 7) & self.FULL_MASK
+
+    # --- 合法着点生成 ---
+    def get_legal_moves(self, me, opp):
+        """Optimized legal move generation without per-call inner function closures."""
+        empty = ~(me | opp) & self.FULL_MASK
+        if empty == 0:
+            return 0
+        moves = 0
+        me_local = me; opp_local = opp; empty_local = empty
+        shift_e  = self._shift_e;  shift_w  = self._shift_w
+        shift_n  = self._shift_n;  shift_s  = self._shift_s
+        shift_ne = self._shift_ne; shift_nw = self._shift_nw
+        shift_se = self._shift_se; shift_sw = self._shift_sw
+        # East
+        x = shift_e(me_local) & opp_local; acc = 0
+        while x:
+            nxt = shift_e(x); acc |= nxt; x = nxt & opp_local
+        moves |= acc & empty_local
+        # West
+        x = shift_w(me_local) & opp_local; acc = 0
+        while x:
+            nxt = shift_w(x); acc |= nxt; x = nxt & opp_local
+        moves |= acc & empty_local
+        # North
+        x = shift_n(me_local) & opp_local; acc = 0
+        while x:
+            nxt = shift_n(x); acc |= nxt; x = nxt & opp_local
+        moves |= acc & empty_local
+        # South
+        x = shift_s(me_local) & opp_local; acc = 0
+        while x:
+            nxt = shift_s(x); acc |= nxt; x = nxt & opp_local
+        moves |= acc & empty_local
+        # NE
+        x = shift_ne(me_local) & opp_local; acc = 0
+        while x:
+            nxt = shift_ne(x); acc |= nxt; x = nxt & opp_local
+        moves |= acc & empty_local
+        # NW
+        x = shift_nw(me_local) & opp_local; acc = 0
+        while x:
+            nxt = shift_nw(x); acc |= nxt; x = nxt & opp_local
+        moves |= acc & empty_local
+        # SE
+        x = shift_se(me_local) & opp_local; acc = 0
+        while x:
+            nxt = shift_se(x); acc |= nxt; x = nxt & opp_local
+        moves |= acc & empty_local
+        # SW
+        x = shift_sw(me_local) & opp_local; acc = 0
+        while x:
+            nxt = shift_sw(x); acc |= nxt; x = nxt & opp_local
+        moves |= acc & empty_local
+        return moves
+
+    # --- 落子 ---
+    def make_move(self, me, opp, pos):
+        """Optimized move application (inline directional scans)."""
+        if pos < 0:  # PASS
+            return opp, me
+        move_bit = 1 << pos
+        if (me | opp) & move_bit:  # occupied
+            return me, opp
+        flips = 0
+        me_local = me; opp_local = opp
+        shift_e  = self._shift_e;  shift_w  = self._shift_w
+        shift_n  = self._shift_n;  shift_s  = self._shift_s
+        shift_ne = self._shift_ne; shift_nw = self._shift_nw
+        shift_se = self._shift_se; shift_sw = self._shift_sw
+        # For each direction, walk once; collect line only if terminated by own piece.
+        # East
+        cur = shift_e(move_bit); line = 0
+        while cur & opp_local:
+            line |= cur; cur = shift_e(cur)
+        if cur & me_local: flips |= line
+        # West
+        cur = shift_w(move_bit); line = 0
+        while cur & opp_local:
+            line |= cur; cur = shift_w(cur)
+        if cur & me_local: flips |= line
+        # North
+        cur = shift_n(move_bit); line = 0
+        while cur & opp_local:
+            line |= cur; cur = shift_n(cur)
+        if cur & me_local: flips |= line
+        # South
+        cur = shift_s(move_bit); line = 0
+        while cur & opp_local:
+            line |= cur; cur = shift_s(cur)
+        if cur & me_local: flips |= line
+        # NE
+        cur = shift_ne(move_bit); line = 0
+        while cur & opp_local:
+            line |= cur; cur = shift_ne(cur)
+        if cur & me_local: flips |= line
+        # NW
+        cur = shift_nw(move_bit); line = 0
+        while cur & opp_local:
+            line |= cur; cur = shift_nw(cur)
+        if cur & me_local: flips |= line
+        # SE
+        cur = shift_se(move_bit); line = 0
+        while cur & opp_local:
+            line |= cur; cur = shift_se(cur)
+        if cur & me_local: flips |= line
+        # SW
+        cur = shift_sw(move_bit); line = 0
+        while cur & opp_local:
+            line |= cur; cur = shift_sw(cur)
+        if cur & me_local: flips |= line
+        if flips == 0:
+            return me, opp
+        me |= move_bit | flips
+        opp &= ~flips
+        return me, opp
 
     # --- 历史重建 ---
     def get_current_board(self, requests, responses):
@@ -190,23 +195,23 @@ class OthelloAI:
             for i in range(turn_count):
                 mv = responses[i]
                 if mv["x"] >= 0:
-                    self.my_pieces, self.opp_pieces = apply_move(self.my_pieces, self.opp_pieces, xy_to_bit(mv["x"], mv["y"]))
+                    self.my_pieces, self.opp_pieces = self.make_move(self.my_pieces, self.opp_pieces, self.xy_to_bit(mv["x"], mv["y"]))
                 if i + 1 < len(requests):
                     opp_mv = requests[i + 1]
                     if opp_mv["x"] >= 0:
-                        self.opp_pieces, self.my_pieces = apply_move(self.opp_pieces, self.my_pieces, xy_to_bit(opp_mv["x"], opp_mv["y"]))
+                        self.opp_pieces, self.my_pieces = self.make_move(self.opp_pieces, self.my_pieces, self.xy_to_bit(opp_mv["x"], opp_mv["y"]))
         else:  # 白方后手
             for i in range(turn_count):
                 opp_mv = requests[i]
                 if opp_mv["x"] >= 0:
-                    self.opp_pieces, self.my_pieces = apply_move(self.opp_pieces, self.my_pieces, xy_to_bit(opp_mv["x"], opp_mv["y"]))
+                    self.opp_pieces, self.my_pieces = self.make_move(self.opp_pieces, self.my_pieces, self.xy_to_bit(opp_mv["x"], opp_mv["y"]))
                 my_mv = responses[i]
                 if my_mv["x"] >= 0:
-                    self.my_pieces, self.opp_pieces = apply_move(self.my_pieces, self.opp_pieces, xy_to_bit(my_mv["x"], my_mv["y"]))
+                    self.my_pieces, self.opp_pieces = self.make_move(self.my_pieces, self.opp_pieces, self.xy_to_bit(my_mv["x"], my_mv["y"]))
             if turn_count < len(requests):
                 cur = requests[turn_count]
                 if cur["x"] >= 0:
-                    self.opp_pieces, self.my_pieces = apply_move(self.opp_pieces, self.my_pieces, xy_to_bit(cur["x"], cur["y"]))
+                    self.opp_pieces, self.my_pieces = self.make_move(self.opp_pieces, self.my_pieces, self.xy_to_bit(cur["x"], cur["y"]))
 
     # --- Botzone 交互（坐标入站交换 / 出站还原） ---
     def parse_and_convert(self, raw_json_str):
@@ -263,7 +268,7 @@ class OthelloAI:
             self.endgame_error = None         # 成功后清理历史错误
             if best_pos < 0:
                 return (-1, -1, score)
-            x, y = bit_to_xy(best_pos)
+            x, y = self.bit_to_xy(best_pos)
             return (x, y, score)
         except Exception as e:
             self.endgame_error = f"call:{type(e).__name__}"
@@ -273,21 +278,20 @@ class OthelloAI:
 
     def choose_move(self):
         """决策入口：优先终局求解，其次普通位运算首合法点"""
-        # 1. 终局精确搜索
+        ### 残局枚举 ###
         empties = 64 - popcount(self.my_pieces | self.opp_pieces)
         if empties <= self.ENDGAME_MOVE_THRESHOLD:
             eg_result = self.endgame_search()
             if eg_result is not None:
                 x, y, _ = eg_result
                 return x, y  # 可能为 (-1,-1)
-        # 2. TODO: MCTS 插入点
-        # 3. 简单策略：取第一个合法着
-        moves_bb = legal_moves(self.my_pieces, self.opp_pieces)
+        ### TODO: later mcts here ###
+        moves_bb = self.get_legal_moves(self.my_pieces, self.opp_pieces)
         if moves_bb == 0:
             return -1, -1
         lsb = moves_bb & -moves_bb
         pos = lsb.bit_length() - 1
-        x, y = bit_to_xy(pos)
+        x, y = self.bit_to_xy(pos)
         return x, y
 
     def count_empties(self):

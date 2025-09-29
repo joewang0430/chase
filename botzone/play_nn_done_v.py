@@ -5,12 +5,16 @@ import time
 import ctypes
 from ctypes import c_uint64, c_int, POINTER, byref
 import random
+import math
+
 import torch
+import torch.nn as nn
 
 # 添加 Python 3.6 兼容 popcount (替换 int.bit_count)
 POPCNT8 = [bin(i).count('1') for i in range(256)]
 ENDING_SO_NAME = "ending.so"
-NN_NAME_1 = "chase8.pt"
+# 优先加载兼容旧 Torch 的 chase8_compat.pt，回退到原始 chase8.pt
+NN_CANDIDATES = ["chase8_compat.pt", "chase8.pt"]
 
 START_TIME = 0
 
@@ -150,6 +154,84 @@ def apply_move(me: int, opp: int, pos: int):
     opp &= ~flips
     return me, opp
 
+# @@ NN part begins
+class ResidualBlock(nn.Module):
+    def __init__(self, ch: int):
+        super().__init__()
+        self.c1 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+        self.b1 = nn.BatchNorm2d(ch)
+        self.c2 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+        self.b2 = nn.BatchNorm2d(ch)
+        self.act = nn.ReLU(inplace=True)
+    def forward(self, x):
+        h = self.c1(x)
+        h = self.b1(h)
+        h = self.act(h)
+        h = self.c2(h)
+        h = self.b2(h)
+        return self.act(x + h)
+    
+class Net(nn.Module):
+    def __init__(self, channels: int = 80, n_blocks: int = 8, input_planes: int = 4):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(input_planes, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.body = nn.Sequential(*[ResidualBlock(channels) for _ in range(n_blocks)])
+        # policy head
+        self.p_head = nn.Sequential(
+            nn.Conv2d(channels, 8, 1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+        )
+        self.p_fc1 = nn.Linear(8 * 8 * 8, 128)
+        self.p_fc2 = nn.Linear(128, 65)  # 64 + pass
+        # value head
+        self.v_head = nn.Sequential(
+            nn.Conv2d(channels, 4, 1, bias=False),
+            nn.BatchNorm2d(4),
+            nn.ReLU(inplace=True),
+        )
+        self.v_fc1 = nn.Linear(4 * 8 * 8, 128)
+        self.v_fc2 = nn.Linear(128, 64)
+        self.v_fc3 = nn.Linear(64, 1)
+        self.act = nn.ReLU(inplace=True)
+        self.tanh = nn.Tanh()
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                fan = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2.0 / fan))
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.body(x)
+        # policy
+        p = self.p_head(x)
+        p = p.view(p.size(0), -1)
+        p = self.act(self.p_fc1(p))
+        p = self.p_fc2(p)  # raw logits
+        # value
+        v = self.v_head(x)
+        v = v.view(v.size(0), -1)
+        v = self.act(self.v_fc1(v))
+        v = self.act(self.v_fc2(v))
+        v = self.tanh(self.v_fc3(v))
+        return p, v
+# @@ NN part ends
+
+
 # Removed numpy; use pure Python integers for bitboards.
 class OthelloAI:
     def __init__(self):
@@ -166,6 +248,93 @@ class OthelloAI:
         self.ENDGAME_VALUE_THRESHOLD = 10  # MCTS 评估截点
         # 调试信息
         self.endgame_error = None  # 记录 ctypes 加载 / 调用失败原因
+
+    # @@ NN part begins
+        self.nn_model = None
+        self.nn_loaded = False
+        self.nn_load_ms = None
+        self.nn_error = None
+
+    def load_nn(self):
+        if self.nn_loaded:
+            return
+        self.nn_loaded = True
+        t0 = time.perf_counter()
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            search_paths = []
+            for name in NN_CANDIDATES:
+                search_paths.append(os.path.join(base_dir, "data", name))
+                search_paths.append(os.path.join(base_dir, name))
+            path = next((p for p in search_paths if os.path.exists(p)), None)
+            if path is None:
+                self.nn_error = "not_found"
+                return
+            ckpt = torch.load(path, map_location="cpu")
+            # 兼容两种保存格式
+            if isinstance(ckpt, dict) and "model_state" in ckpt:
+                arch = ckpt.get("arch", {})
+                ch = arch.get("channels", 80)
+                blocks = arch.get("n_blocks", 8)
+                inp = arch.get("input_planes", 4)
+                net = Net(channels=ch, n_blocks=blocks, input_planes=inp)
+                state = ckpt["model_state"]
+            elif isinstance(ckpt, dict):
+                # 直接当成 state_dict, 使用默认结构参数
+                net = Net()
+                state = ckpt
+            else:
+                self.nn_error = "bad_format"
+                return
+            # --- 兼容旧命名：训练时可能用 blocks.ModuleList 而现在实现用 body.Sequential
+            if any(k.startswith("blocks.") or k.startswith("p_c") or k.startswith("p_bn") or k.startswith("v_c") or k.startswith("v_bn") for k in state.keys()):
+                remapped = {}
+                for k, v in state.items():
+                    newk = k
+                    if newk.startswith("blocks."):
+                        newk = 'body.' + newk[len("blocks."):]
+                    elif newk.startswith("p_c."):
+                        newk = 'p_head.0.' + newk[len("p_c."):]
+                    elif newk.startswith("p_bn."):
+                        newk = 'p_head.1.' + newk[len("p_bn."):]
+                    elif newk.startswith("v_c."):
+                        newk = 'v_head.0.' + newk[len("v_c."):]
+                    elif newk.startswith("v_bn."):
+                        newk = 'v_head.1.' + newk[len("v_bn."):]
+                    remapped[newk] = v
+                state = remapped
+            missing, unexpected = net.load_state_dict(state, strict=False)
+            if missing:
+                # 记录但不报错，让运行继续；截断防止过长
+                miss_s = ','.join(missing[:4])
+                if len(missing) > 4:
+                    miss_s += f"+{len(missing)-4}"
+                self.nn_error = f"partial_missing:{miss_s}"
+            if unexpected:
+                unexp_s = ','.join(unexpected[:4])
+                if len(unexpected) > 4:
+                    unexp_s += f"+{len(unexpected)-4}"
+                # 如果之前已经有 missing 标志，不覆盖，附加
+                if self.nn_error:
+                    self.nn_error += f"|unexp:{unexp_s}"
+                else:
+                    self.nn_error = f"unexpected:{unexp_s}"
+            net.eval()
+            self.nn_model = net
+            # 若只有 missing/ unexpected 记录仍视作可用；完全成功则清空错误
+            if self.nn_error and self.nn_error.startswith(('partial_missing','unexpected')):
+                pass
+            else:
+                self.nn_error = None
+        except Exception as e:
+            self.nn_model = None
+            msg = str(e)
+            if len(msg) > 120:
+                msg = msg[:117] + '...'
+            self.nn_error = f"{type(e).__name__}:{msg}"
+        finally:
+            self.nn_load_ms = (time.perf_counter() - t0) * 1000.0
+    # @@ NN part ends
 
     # --- 坐标与位操作 ---
     # bit_to_xy / set_bit 已抽到模块级函数
@@ -339,7 +508,29 @@ class OthelloAI:
             botzone_message = "OK"
         ### 整合输出 ###
         dbg_parts = [f"empties={empties}", f"flag={botzone_flag}", f"val={botzone_value}", f"t={botzone_time}", f"msg={botzone_message}"]
+
+    # @@ NN part begins
+        # NN 加载状态
+        if self.nn_loaded:
+            if self.nn_model is not None and self.nn_error is None:
+                if self.nn_load_ms is not None:
+                    dbg_parts.append(f"nn=OK@{self.nn_load_ms:.1f}ms")
+                else:
+                    dbg_parts.append("nn=OK")
+            else:
+                dbg_parts.append(f"nn=ERR:{self.nn_error}")
+        else:
+            dbg_parts.append("nn=?")
+        # NN 基准
+        if hasattr(self, "nn_bench_total_ms"):
+            if self.nn_bench_total_ms is not None:
+                dbg_parts.append(
+                    f"bench={self.nn_bench_n}@{self.nn_bench_total_ms:.1f}ms/{self.nn_bench_avg_ms:.3f}ms"
+                )
+            elif hasattr(self, "nn_bench_err"):
+                dbg_parts.append(f"bench_err={self.nn_bench_err}")
         return ';'.join(dbg_parts)
+    # @@ NN part ends
 
 
     def run(self):
@@ -350,6 +541,68 @@ class OthelloAI:
             return
         requests, responses = self.parse_and_convert(raw)
         self.get_current_board(requests, responses)
+
+        # ----------------------------- @@ NN part begins
+        self.load_nn()
+
+        # 基准：若模型成功加载，对当前局面构造一次输入，做 1000 次前向测时
+        if self.nn_model is not None and self.nn_error is None and not getattr(self, 'nn_bench_done', False):
+            # 构造输入平面 (1,4,8,8): 0=my,1=opp,2=empty,3=legal
+            planes = torch.zeros((1, 4, 8, 8), dtype=torch.float32)
+            my = self.my_pieces
+            opp = self.opp_pieces
+            occ = my | opp
+            # my pieces
+            tmp = my
+            while tmp:
+                lsb = tmp & -tmp
+                idx = lsb.bit_length() - 1
+                r, c = divmod(idx, 8)
+                planes[0, 0, r, c] = 1.0
+                tmp ^= lsb
+            # opp pieces
+            tmp = opp
+            while tmp:
+                lsb = tmp & -tmp
+                idx = lsb.bit_length() - 1
+                r, c = divmod(idx, 8)
+                planes[0, 1, r, c] = 1.0
+                tmp ^= lsb
+            # empty
+            empty = (~occ) & FULL_MASK
+            tmp = empty
+            while tmp:
+                lsb = tmp & -tmp
+                idx = lsb.bit_length() - 1
+                r, c = divmod(idx, 8)
+                planes[0, 2, r, c] = 1.0
+                tmp ^= lsb
+            # legal
+            legal_bb = legal_moves(my, opp)
+            tmp = legal_bb
+            while tmp:
+                lsb = tmp & -tmp
+                idx = lsb.bit_length() - 1
+                r, c = divmod(idx, 8)
+                planes[0, 3, r, c] = 1.0
+                tmp ^= lsb
+            self.nn_bench_n = 1000
+            try:
+                with torch.no_grad():
+                    # 预热一次（不计入时间，避免首次 BN / 缓存初始化影响）
+                    _ = self.nn_model(planes)
+                    t0 = time.perf_counter()
+                    for _ in range(self.nn_bench_n):
+                        _ = self.nn_model(planes)
+                    t1 = time.perf_counter()
+                self.nn_bench_total_ms = (t1 - t0) * 1000.0
+                self.nn_bench_avg_ms = self.nn_bench_total_ms / self.nn_bench_n
+            except Exception as e:
+                self.nn_bench_total_ms = None
+                self.nn_bench_avg_ms = None
+                self.nn_bench_err = type(e).__name__
+            self.nn_bench_done = True  # 标记只跑一次
+        # ----------------------------- @@ NN part ends
 
         # ----------------------------- 落子决策
         empties = self.count_empties()

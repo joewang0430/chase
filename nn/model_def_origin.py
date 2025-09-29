@@ -2,26 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-"""模型输入平面定义 (更新版)
-平面索引:
-0: 我方棋子 (current player)
-1: 对方棋子
-2: 空格 (empty = 1 表示尚未落子)
-3: 我方合法着点掩码 (legal moves)
-"""
-INPUT_PLANES = 4
+# 仅 3 个输入平面：
+# 0: 我方棋子（始终保证是“当前准备落子一方”的棋子）
+# 1: 对方棋子
+# 2: 合法着点掩码（1 表示此格当前可落子）
+INPUT_PLANES = 3
 
 # 复用的全局缓冲，少分配；单线程环境安全（Botzone 单核）。
 _INPUT_BUFFER = torch.zeros((INPUT_PLANES, 8, 8), dtype=torch.float32)
 
 def build_input_planes(my_bb: int, opp_bb: int, legal_bb: int):
-    """构建输入张量 (1,4,8,8)
-    参数:
-      my_bb    : 当前行动方棋子 bitboard
-      opp_bb   : 对手棋子 bitboard
-      legal_bb : 当前行动方合法着点 bitboard
-    平面:
-      0 my, 1 opp, 2 empty, 3 legal
+    """
+    将位棋盘转换成 (1,3,8,8) 张量（float32）。
+    my_bb / opp_bb / legal_bb 均为 64bit 整数。
+    返回的张量默认可直接传入网络（无需再 clone，如果只读）。
     """
     buf = _INPUT_BUFFER
     buf.zero_()
@@ -38,10 +32,8 @@ def build_input_planes(my_bb: int, opp_bb: int, legal_bb: int):
             buf[1, r, c] = 1.0
         occ ^= lsb
 
-    # 空格平面: 遍历空位设置 1
-    FULL_MASK = 0xFFFFFFFFFFFFFFFF
-    empty_bb = (~(my_bb | opp_bb)) & FULL_MASK
-    m = empty_bb
+    # 扫描合法着点
+    m = legal_bb
     while m:
         lsb = m & -m
         idx = lsb.bit_length() - 1
@@ -49,16 +41,7 @@ def build_input_planes(my_bb: int, opp_bb: int, legal_bb: int):
         buf[2, r, c] = 1.0
         m ^= lsb
 
-    # 合法着点平面
-    m = legal_bb
-    while m:
-        lsb = m & -m
-        idx = lsb.bit_length() - 1
-        r, c = divmod(idx, 8)
-        buf[3, r, c] = 1.0
-        m ^= lsb
-
-    return buf.unsqueeze(0)  # (1,4,8,8)
+    return buf.unsqueeze(0)  # (1,3,8,8)
 
 class ResidualBlock(nn.Module):
     """
@@ -78,35 +61,26 @@ class ResidualBlock(nn.Module):
         return F.relu(x + y, inplace=True)
 
 class Net(nn.Module):
-    """网络版本 C (降维变体)
-    结构:
-      输入平面: 4 (my, opp, empty, legal)
-      主干通道: 64 (由原 80 降为 64)
-      Residual Blocks: 7 个 (由 8 减为 7)
-      Policy 头: Conv(64->8 1x1) -> BN -> ReLU -> FC(512->128->65)
-      Value  头: Conv(64->4 1x1) -> BN -> ReLU -> FC(256->128->64->1, tanh)
-    其余接口 / 输出形状保持不变，便于与原版推理代码复用。
     """
-    def __init__(self, channels: int = 64, n_blocks: int = 7):
+    版本A:
+      Stem: 3->64
+      Residual Blocks: 6 个 (64 通道)
+      Policy Head: Conv(64->32)->Conv(32->2)->FC(128->65)
+      Value  Head: Conv(64->32)->Conv(32->1)->FC(64->64->1, tanh)
+    """
+    def __init__(self, channels: int = 64, n_blocks: int = 6):
         super().__init__()
-        self.channels = channels
-        self.n_blocks = n_blocks
-
-        # Stem
         self.stem = nn.Sequential(
             nn.Conv2d(INPUT_PLANES, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True)
         )
-        # Residual trunk
-        self.blocks = nn.ModuleList([ResidualBlock(channels) for _ in range(n_blocks)])
-
+        self.blocks = nn.ModuleList(ResidualBlock(channels) for _ in range(n_blocks))
         # --- Policy 头 ---
         self.p_c = nn.Conv2d(channels, 8, 1, bias=False)   # 1x1: 64->8
         self.p_bn = nn.BatchNorm2d(8)
         self.p_fc1 = nn.Linear(8 * 8 * 8, 128)             # 512 -> 128
         self.p_fc2 = nn.Linear(128, 65)                    # 128 -> 65
-
         # --- Value 头 ---
         self.v_c = nn.Conv2d(channels, 4, 1, bias=False)   # 1x1: 64->4
         self.v_bn = nn.BatchNorm2d(4)
@@ -134,7 +108,7 @@ class Net(nn.Module):
         
         
 if __name__ == "__main__":
-    # 自检: 初始局面 + 给定合法着点
+    # 自检
     my = 0x0000000810000000
     opp = 0x0000001008000000
     legal = 0x0000102004080000
@@ -142,6 +116,6 @@ if __name__ == "__main__":
     net = Net().eval()
     with torch.no_grad():
         p, v = net(x)
-    print("Input:", x.shape)        # (1,4,8,8)
+    print("Input:", x.shape)        # (1,3,8,8)
     print("Policy:", p.shape)       # (1,65)
     print("Value:", v.shape)        # (1,1)

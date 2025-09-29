@@ -5,7 +5,10 @@ import time
 import ctypes
 from ctypes import c_uint64, c_int, POINTER, byref
 import random
+import math
+
 import torch
+import torch.nn as nn
 
 # 添加 Python 3.6 兼容 popcount (替换 int.bit_count)
 POPCNT8 = [bin(i).count('1') for i in range(256)]

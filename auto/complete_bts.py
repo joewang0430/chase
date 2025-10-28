@@ -7,6 +7,9 @@
 # python3 auto/complete_bts.py --driver mac --limit 1
 # python3 -m auto.complete_bts --mock --limit 5
 
+# prob:
+# python3 auto/complete_bts.py --driver mac --probe-click d3,c5,f6,f5,g6,d2,c3
+
 """
 Simple filler: read full_book.jsonl -> update incomplete records -> overwrite same file.
 - No lock file
@@ -130,31 +133,35 @@ def main():
     # 新增探针：只启动并截图，不触碰 JSONL
     ap.add_argument("--probe-open", action="store_true", help="just launch/activate target app and exit")
     ap.add_argument("--probe-snap", action="store_true", help="screenshot the app window to /tmp/othello_sensei.png and exit")
-    ap.add_argument("--probe-calibrate", action="store_true", help="calibrate board area (top-left and bottom-right)")  # 只做标定（创建/更新 ~/.sensei_calib.json），不触碰 JSONL，完成后直接退出
-    ap.add_argument("--probe-click", type=str, default=None, help="comma-separated squares to click, e.g. a1,d3,e6")    # 读取标定并在这些格子上试点点击，用于校验映射是否正确；不触碰 JSONL，完成后直接退出
+    # 标定/测试 棋盘：
+    ap.add_argument("--probe-calibrate", action="store_true", help="calibrate board area (top-left and bottom-right)")  # 只做标定（创建/更新 ~/.sensei_calib.json），不触碰 JSONL，完成后直接退出 -- 用户鼠标标记board边界在哪里
+    ap.add_argument("--probe-click", type=str, default=None, help="comma-separated squares to click, e.g. a1,d3,e6")    # 读取标定并在这些格子上试点点击，用于校验映射是否正确；不触碰 JSONL，完成后直接退出 -- 输入几个board位置看看点的对不对
+    # 标定/测试 “<<” 和 “yes”，用于重开棋局
+    ap.add_argument("--probe-calibrate-nav", action="store_true", help="calibrate the '<<' reset button position")      # 测试 << 重制键，和上面一样
+    ap.add_argument("--probe-calibrate-yes", action="store_true", help="calibrate the 'Yes' button in the 'New game?' dialog")
+    ap.add_argument("--probe-reset", action="store_true", help="click the reset button and handle 'New game?' dialog")
     
     args = ap.parse_args()
 
     # 探针操作：
-    if args.probe_open or args.probe_snap or args.probe_calibrate or args.probe_click:
-        d = create_driver(engine_time=4.0,
-                          driver=args.driver,
-                          mock=args.mock or (args.driver == "mock"))
+    if (args.probe_open or args.probe_snap or args.probe_calibrate or args.probe_click
+        or args.probe_calibrate_nav or args.probe_calibrate_yes or args.probe_reset):
+        d = create_driver(engine_time=4.0, driver=args.driver, mock=args.mock or (args.driver == "mock"))
         d.ensure_running()
         did_any = False
-        if args.probe_snap:
-            out = "/tmp/othello_sensei.png"
-            if hasattr(d, "snap_window"):
-                out = d.snap_window(out)
-                print(f"[SNAP] saved {out}")
-            else:
-                print("[SNAP] not supported by this driver")
-            did_any = True
+        if args.probe_snap and hasattr(d, "snap_window"):
+            out = "/tmp/othello_sensei.png"; out = d.snap_window(out); print(f"[SNAP] saved {out}"); did_any = True
         if args.probe_calibrate and hasattr(d, "probe_calibrate"):
             d.probe_calibrate(); did_any = True
+        if args.probe_calibrate_nav and hasattr(d, "probe_calibrate_nav"):
+            d.probe_calibrate_nav(); did_any = True
+        if args.probe_calibrate_yes and hasattr(d, "probe_calibrate_yes"):
+            d.probe_calibrate_yes(); did_any = True
         if args.probe_click and hasattr(d, "probe_click"):
             coords = [s.strip() for s in args.probe_click.split(",") if s.strip()]
             d.probe_click(coords); did_any = True
+        if args.probe_reset and hasattr(d, "reset_board"):
+            d.reset_board(); print("[PROBE] reset_board done"); did_any = True
         if not did_any:
             print("[PROBE] ensure_running OK")
         return

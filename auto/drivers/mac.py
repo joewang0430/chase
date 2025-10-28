@@ -27,6 +27,22 @@ def _load_calib() -> dict:
     with open(CALIB_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
     
+# 合并保存（不覆盖已有字段）
+def _save_calib_merged(update: dict) -> dict:
+    '''
+    先读现有/Users/juanjuan1/.sensei_calib.json，再用新键值更新并写回，保留未更新的旧键。
+    '''
+    cur = {}
+    if os.path.exists(CALIB_PATH):
+        try:
+            with open(CALIB_PATH, "r", encoding="utf-8") as f:
+                cur = json.load(f) or {}
+        except Exception:
+            cur = {}
+    cur.update(update)
+    _save_calib(cur)
+    return cur
+    
 '''
 文件里存了什么
 JSON 字段：
@@ -38,9 +54,62 @@ JSON 字段：
     运行时：实际点击坐标 = 窗口坐标 + board_rel 里的相对坐标
 '''
 
-# 把如 "d3" 的棋盘坐标转换为屏幕像素点(x,y)，使用 window 矩形(win=wx,wy,ww,wh)与棋盘相对矩形(board_rel=bx,by,bw,bh)，按 a1 左下、h8 右上的约定计算中心点
+def _dismiss_new_game_prompt(name: str) -> bool:
+    """
+    尝试关闭“New game?”提示。返回 True 表示做了动作（点了按钮或发回车）。
+    需要“辅助功能”权限。
+    """
+    script = (
+        'tell application "System Events"\n'
+        f'  if not (exists process "{name}") then return false\n'
+        f'  tell process "{name}"\n'
+        '    set acted to false\n'
+        '    -- sheet（贴在窗口上的对话）\n'
+        '    try\n'
+        '      if exists sheet 1 of front window then\n'
+        '        set s to sheet 1 of front window\n'
+        '        set btns to {"Yes","OK","Ok","确定","是"}\n'
+        '        repeat with t in btns\n'
+        '          try\n'
+        '            if exists button (t as string) of s then\n'
+        '              click button (t as string) of s\n'
+        '              set acted to true\n'
+        '              exit repeat\n'
+        '            end if\n'
+        '          end try\n'
+        '        end repeat\n'
+        '        if acted is false then key code 36 -- Return\n'
+        '        set acted to true\n'
+        '      end if\n'
+        '    end try\n'
+        '    -- AXDialog（独立对话框）\n'
+        '    try\n'
+        '      if exists (window 1 whose subrole is "AXDialog") then\n'
+        '        set dlg to (window 1 whose subrole is "AXDialog")\n'
+        '        set btns2 to {"Yes","OK","Ok","确定","是"}\n'
+        '        repeat with t in btns2\n'
+        '          try\n'
+        '            if exists button (t as string) of dlg then\n'
+        '              click button (t as string) of dlg\n'
+        '              set acted to true\n'
+        '              exit repeat\n'
+        '            end if\n'
+        '          end try\n'
+        '        end repeat\n'
+        '        if acted is false then key code 36 -- Return\n'
+        '        set acted to true\n'
+        '      end if\n'
+        '    end try\n'
+        '    return acted\n'
+        '  end tell\n'
+        'end tell'
+    )
+    out = _run_osa(script).lower()
+    return out == "true"
+
+# 把如 "d3" 的棋盘坐标转换为屏幕像素点(x,y)，使用窗口矩形与棋盘相对矩形，按 a1 左上、h8 右下 的约定计算格子中心点
 def _coord_to_xy(coord: str, win: Tuple[int,int,int,int], board_rel: Tuple[int,int,int,int]) -> Tuple[int,int]:
-    # coord: "d3" 等；a1 左下，h8 右上
+    # coord: "d3"；a1 左上，h8 右下
     wx, wy, ww, wh = win
     bx, by, bw, bh = board_rel
     if len(coord) != 2:
@@ -195,9 +264,36 @@ class MacDriver(SoftwareDriverBase):
         bw, bh = brx - tlx, bry - tly
         if bw <= 0 or bh <= 0:
             raise ValueError(f"bad board rectangle: bw={bw}, bh={bh}")
-        data = {"app": APP_NAME, "board_rel": [int(bx), int(by), int(bw), int(bh)]}
-        _save_calib(data)
+        data = _save_calib_merged({"app": APP_NAME, "board_rel": [int(bx), int(by), int(bw), int(bh)]})
         print(f"[CAL] saved to {CALIB_PATH}: board_rel={data['board_rel']}")
+        return CALIB_PATH
+    
+    # 标定“<<”复位按钮（相对窗口坐标）
+    def probe_calibrate_nav(self) -> str:
+        import pyautogui
+        pyautogui.FAILSAFE = False
+        self.ensure_running()
+        wx, wy, ww, wh = _get_window_bounds(APP_NAME)
+        print("[CAL] 把鼠标移动到 顶部工具栏的 <<（回到开局） 图标上，按回车确认...")
+        input()
+        p = pyautogui.position()
+        nx, ny = p.x - wx, p.y - wy
+        data = _save_calib_merged({"nav_reset_rel": [int(nx), int(ny)]})
+        print(f"[CAL] saved to {CALIB_PATH}: nav_reset_rel={data['nav_reset_rel']}")
+        return CALIB_PATH
+    
+    # 标定“New game?”弹窗里的 Yes 按钮（相对窗口坐标）
+    def probe_calibrate_yes(self) -> str:
+        import pyautogui
+        pyautogui.FAILSAFE = False
+        self.ensure_running()
+        wx, wy, ww, wh = _get_window_bounds(APP_NAME)
+        print("[CAL] 请先让弹窗出现（比如点一次 <<），把鼠标移动到弹窗的 Yes 按钮上，按回车确认...")
+        input()
+        p = pyautogui.position()
+        yx, yy = p.x - wx, p.y - wy
+        data = _save_calib_merged({"nav_yes_rel": [int(yx), int(yy)]})
+        print(f"[CAL] saved to {CALIB_PATH}: nav_yes_rel={data['nav_yes_rel']}")
         return CALIB_PATH
     
     # 试点点击：按棋盘坐标点击（例如 ["d3","e6"]）
@@ -222,12 +318,55 @@ class MacDriver(SoftwareDriverBase):
             time.sleep(delay)
     
     def reset_board(self) -> None:
-        # TODO: 回到初始局面（下一步实现）
-        return
+        import pyautogui
+        pyautogui.FAILSAFE = False
+        self.ensure_running()
+        cfg = _load_calib()
+        nav = cfg.get("nav_reset_rel")
+        if not (isinstance(nav, list) and len(nav) == 2):
+            raise FileNotFoundError(f"nav_reset_rel missing in {CALIB_PATH}. Run --probe-calibrate-nav first.")
+
+        wx, wy, ww, wh = _get_window_bounds(APP_NAME)
+        # 1) 点“<<”
+        nx, ny = nav
+        pyautogui.click(wx + int(nx), wy + int(ny))
+        time.sleep(0.20)
+
+        # 2) 先用键盘兜底（很多弹窗 Enter = 默认 Yes）
+        pyautogui.press("enter")
+        time.sleep(0.12)
+
+        # 3) 如果你标定了 Yes，就直接点它（即使 AX 不可见也有效）
+        yes = cfg.get("nav_yes_rel")
+        if isinstance(yes, list) and len(yes) == 2:
+            yx, yy = yes
+            pyautogui.click(wx + int(yx), wy + int(yy))
+            time.sleep(0.12)
+
+        # 4) 再补一次 Enter，确保关闭
+        pyautogui.press("enter")
+        time.sleep(0.10)
+
+        # 5) 最后再尝试一次 AX 方式（若可见就点掉）
+        _dismiss_new_game_prompt(APP_NAME)
 
     def replay_moves(self, moves_played: List[str]) -> None:
-        # TODO: 点击/快捷键复盘；"--" 表示 PASS
-        return
+        # 依次点子；"--" 跳过
+        import pyautogui
+        pyautogui.FAILSAFE = False
+        self.ensure_running()
+        cfg = _load_calib()
+        board_rel = cfg.get("board_rel")
+        if not (isinstance(board_rel, list) and len(board_rel) == 4):
+            raise FileNotFoundError(f"board_rel missing in {CALIB_PATH}. Run --probe-calibrate first.")
+        wx, wy, ww, wh = _get_window_bounds(APP_NAME)
+        bx, by, bw, bh = board_rel
+        for mv in moves_played:
+            if mv == "--": 
+                time.sleep(0.12); continue
+            x, y = _coord_to_xy(mv, (wx,wy,ww,wh), (bx,by,bw,bh))
+            pyautogui.click(x, y)
+            time.sleep(0.12)
 
     def wait_and_read(self) -> Tuple[List[str], float]:
         # TODO: 等 self.engine_time 并解析 UI

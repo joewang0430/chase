@@ -4,6 +4,7 @@
 # python3 auto/complete_bts.py --mock --limit 5
 # python3 auto/complete_bts.py --driver auto --limit 50
 # python3 auto/complete_bts.py --driver mac --time-budget 60
+# python3 auto/complete_bts.py --driver mac --limit 1
 # python3 -m auto.complete_bts --mock --limit 5
 
 """
@@ -85,7 +86,7 @@ def process(limit: Optional[int], time_budget: Optional[float], mock: bool, driv
             # -- 到此为止，一定是：该行是“可成功解析的 && 还没有被complete的 JSON”。且工作量规定允许（没有做超过规定的量）
                 try:
                     driver.engine_time = float(obj.get("engine_time", 4.0))
-                    best_moves, net_win = driver.solve(obj.get("moves_played", []))     # -- 这里调用cv一系列操作得到 sensei 解
+                    best_moves, net_win = driver.solve(obj.get("moves_played", []))     # -- 这里调用 driver 的一系列操作得到 sensei 解
                     if not isinstance(best_moves, list):    # 程序检查 best_moves 是否是列表；如果不是列表，就把它包成单元素列表。
                         best_moves = [str(best_moves)]
                     obj["best_moves"] = [str(m) for m in best_moves]    # 程序把 best_moves 中的每个元素都转换成字符串，并写回到 obj["best_moves"]（例如 'e3' 或 '--'）。

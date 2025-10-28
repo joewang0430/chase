@@ -140,12 +140,15 @@ def main():
     ap.add_argument("--probe-calibrate-nav", action="store_true", help="calibrate the '<<' reset button position")      # 测试 << 重制键，和上面一样
     ap.add_argument("--probe-calibrate-yes", action="store_true", help="calibrate the 'Yes' button in the 'New game?' dialog")
     ap.add_argument("--probe-reset", action="store_true", help="click the reset button and handle 'New game?' dialog")
+    # 测试 OCR 读取
+    ap.add_argument("--probe-read", action="store_true", help="capture board and OCR yellow best move/value (debug only)")
     
     args = ap.parse_args()
 
     # 探针操作：
     if (args.probe_open or args.probe_snap or args.probe_calibrate or args.probe_click
-        or args.probe_calibrate_nav or args.probe_calibrate_yes or args.probe_reset):
+        or args.probe_calibrate_nav or args.probe_calibrate_yes or args.probe_reset
+        or args.probe_read):
         d = create_driver(engine_time=4.0, driver=args.driver, mock=args.mock or (args.driver == "mock"))
         d.ensure_running()
         did_any = False
@@ -162,6 +165,8 @@ def main():
             d.probe_click(coords); did_any = True
         if args.probe_reset and hasattr(d, "reset_board"):
             d.reset_board(); print("[PROBE] reset_board done"); did_any = True
+        if args.probe_read and hasattr(d, "probe_read"):
+            d.probe_read(); did_any = True
         if not did_any:
             print("[PROBE] ensure_running OK")
         return

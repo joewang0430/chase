@@ -208,6 +208,197 @@ def _get_window_bounds(name: str) -> Tuple[int, int, int, int]:
 def _snap_rect_png(x: int, y: int, w: int, h: int, out_path: str) -> None:
     # 用系统截图工具截取矩形区域（需要屏幕录制权限）
     subprocess.run(["screencapture", "-x", "-R", f"{x},{y},{w},{h}", out_path], check=True)
+
+# ---------------------------------------- OCR phase below
+
+def _get_board_rect_px() -> Tuple[int,int,int,int]:
+    """
+    读取标定并计算棋盘的屏幕绝对矩形 (x,y,w,h)。
+    """
+    cfg = _load_calib()
+    wx, wy, ww, wh = _get_window_bounds(APP_NAME)
+    board_rel = cfg.get("board_rel")
+    if not (isinstance(board_rel, list) and len(board_rel) == 4):
+        raise FileNotFoundError(f"board_rel missing in {CALIB_PATH}. Run --probe-calibrate first.")
+    bx, by, bw, bh = board_rel
+    return wx + int(bx), wy + int(by), int(bw), int(bh)
+
+def _screenshot_board() -> "Image.Image":
+    """
+    截取棋盘区域为 PIL.Image（需要屏幕录制权限）。
+    """
+    from PIL import ImageGrab  # 延迟导入
+    x, y, w, h = _get_board_rect_px()
+    img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+    return img
+
+def _xy_to_coord_local(x: float, y: float, w: int, h: int) -> str:
+    """
+    将棋盘内相对坐标(x,y)映射为坐标字符串（a1 左上，h8 右下）。
+    """
+    cell_w = w / 8.0
+    cell_h = h / 8.0
+    c = int(max(0, min(7, x // cell_w)))   # 0..7 左→右
+    r = int(max(0, min(7, y // cell_h)))   # 0..7 上→下
+    return f"{chr(ord('a') + c)}{r + 1}"
+
+def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None) -> Tuple[List[str], float]:
+    """
+    基于棋盘截图，定位黄色最佳点，OCR 读数值。
+    返回 ([best_move], net_win)。a1 左上，h8 右下。
+    """
+    import numpy as np
+    import cv2
+    import pytesseract
+    from PIL import Image
+
+    # 1) 转 OpenCV 图像并做黄色分割
+    img_rgb = np.array(img_pil.convert("RGB"))  # HxWx3, RGB
+    H, W = img_rgb.shape[:2]
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    # 黄色阈值（适度放宽）
+    lower = (12, 80, 150)   # H,S,V
+    upper = (60, 255, 255)
+    mask = cv2.inRange(hsv, lower, upper)
+
+    # 形态学：先闭运算连通，再轻微膨胀
+    k = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+    mask = cv2.dilate(mask, np.ones((2, 2), np.uint8), iterations=1)
+
+    # 2) 连通域候选
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    candidates = []
+    for i in range(1, num):
+        x, y, w, h, area = stats[i]
+        if area < 12:  # 放低面积门槛
+            continue
+        cx, cy = centroids[i]
+        pad = 3  # 适度放大候选框
+        x0 = max(0, x - pad); y0 = max(0, y - pad)
+        x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
+        candidates.append((x0, y0, x1, y1, cx, cy, area))
+
+    if not candidates:
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            Image.fromarray(img_rgb).save(os.path.join(debug_dir, "sensei_board.png"))
+            cv2.imwrite(os.path.join(debug_dir, "sensei_mask.png"), mask)
+        raise RuntimeError("no yellow candidates found; adjust color threshold or ensure highlights are visible")
+
+    # 3) 对候选框做 OCR（多种预处理与配置尝试）
+    results = []
+    try_cfgs = [
+        "--psm 7 -c tessedit_char_whitelist=+-0123456789.",
+        "--psm 6 -c tessedit_char_whitelist=+-0123456789.",
+        "--psm 8 -c tessedit_char_whitelist=+-0123456789.",
+    ]
+    roi_idx = 0
+    for x0, y0, x1, y1, cx, cy, area in candidates:
+        # 仅保留黄色前景，去掉背景
+        roi_rgb = img_rgb[y0:y1, x0:x1]
+        roi_mask = mask[y0:y1, x0:x1]
+        fg = cv2.bitwise_and(roi_rgb, roi_rgb, mask=roi_mask)
+
+        # 灰度 + OTSU 二值（白底黑字）
+        gray = cv2.cvtColor(fg, cv2.COLOR_RGB2GRAY)
+        bin1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        bin_inv = 255 - bin1
+        bin_inv = cv2.dilate(bin_inv, np.ones((2, 2), np.uint8), iterations=1)
+        up = cv2.resize(bin_inv, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST)
+
+        txt = ""
+        num_match = None
+        for cfg in try_cfgs:
+            s = pytesseract.image_to_string(up, config=cfg).strip()
+            m = re.search(r'[+-]?\d+(?:\.\d+)?', s)
+            if m:
+                txt = s
+                num_match = m
+                break
+
+        # 若失败，换自适应阈值再试
+        if num_match is None:
+            bin2 = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5
+            )
+            bin2 = cv2.dilate(bin2, np.ones((2, 2), np.uint8), iterations=1)
+            up2 = cv2.resize(bin2, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST)
+            for cfg in try_cfgs:
+                s = pytesseract.image_to_string(up2, config=cfg).strip()
+                m = re.search(r'[+-]?\d+(?:\.\d+)?', s)
+                if m:
+                    txt = s
+                    num_match = m
+                    up = up2
+                    break
+
+        if num_match is None:
+            if debug_dir:
+                os.makedirs(debug_dir, exist_ok=True)
+                cv2.imwrite(os.path.join(debug_dir, f"roi_{roi_idx:02d}_gray.png"), gray)
+                cv2.imwrite(os.path.join(debug_dir, f"roi_{roi_idx:02d}_bin.png"), bin1)
+                cv2.imwrite(os.path.join(debug_dir, f"roi_{roi_idx:02d}_up.png"), up)
+            roi_idx += 1
+            continue
+
+        try:
+            val = float(num_match.group(0))
+        except ValueError:
+            if debug_dir:
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(os.path.join(debug_dir, f"roi_{roi_idx:02d}_raw.txt"), "w", encoding="utf-8") as f:
+                    f.write(txt)
+            roi_idx += 1
+            continue
+
+        coord = _xy_to_coord_local(cx, cy, W, H)
+        results.append((coord, val, (x0, y0, x1, y1), (cx, cy)))
+
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(debug_dir, f"roi_{roi_idx:02d}_ok.png"), up)
+        roi_idx += 1
+
+    if not results:
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            Image.fromarray(img_rgb).save(os.path.join(debug_dir, "sensei_board.png"))
+            cv2.imwrite(os.path.join(debug_dir, "sensei_mask.png"), mask)
+        raise RuntimeError("OCR got no usable numbers from yellow candidates")
+
+    # 4) 合并同格，选取最佳
+    merged: dict = {}
+    for coord, val, box, ctr in results:
+        if coord not in merged or val > merged[coord][0]:
+            merged[coord] = (val, box, ctr)
+
+    pairs = [(c, v[0]) for c, v in merged.items()]
+    pairs.sort(key=lambda t: t[1], reverse=True)
+    best_val = pairs[0][1]
+    tied = [p for p in pairs if abs(p[1] - best_val) <= 0.1 + 1e-9]
+    tied.sort(key=lambda t: t[0])
+    best_move = tied[0][0]
+    net_win = float(best_val)
+
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        base = os.path.join(debug_dir, "sensei")
+        Image.fromarray(img_rgb).save(base + "_board.png")
+        cv2.imwrite(base + "_mask.png", mask)
+        vis = img_bgr.copy()
+        for coord, (val, box, ctr) in merged.items():
+            x0, y0, x1, y1 = box
+            cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 255, 255), 1)
+            cv2.putText(
+                vis, f"{coord}:{val:.2f}", (x0, max(10, y0 - 3)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA
+            )
+        cv2.imwrite(base + "_vis.png", vis)
+
+    return [best_move], net_win
     
 # ---------------------------------------- Mac Driver
 
@@ -316,6 +507,20 @@ class MacDriver(SoftwareDriverBase):
             x, y = _coord_to_xy(c, (wx,wy,ww,wh), (bx,by,bw,bh))
             pyautogui.click(x, y)
             time.sleep(delay)
+
+    def probe_read(self) -> Tuple[List[str], float]:
+        """
+        截取棋盘 -> 识别黄色最佳点 -> 打印并保存调试图到 /tmp/sensei_read_<ts>/
+        """
+        self.ensure_running()
+        # 等待一点时间让评估稳定（用 engine_time；没有就默认 4s）
+        time.sleep(float(getattr(self, "engine_time", 4.0)))
+        img = _screenshot_board()
+        tsdir = f"/tmp/sensei_read_{int(time.time())}"
+        best_moves, net_win = _analyze_board_best(img, debug_dir=tsdir)
+        print(f"[READ] best_moves={best_moves} net_win={net_win:.2f}")
+        print(f"[READ] debug saved to {tsdir}")
+        return best_moves, net_win
     
     def reset_board(self) -> None:
         import pyautogui
@@ -369,5 +574,10 @@ class MacDriver(SoftwareDriverBase):
             time.sleep(0.12)
 
     def wait_and_read(self) -> Tuple[List[str], float]:
-        # TODO: 等 self.engine_time 并解析 UI
-        raise NotImplementedError("Implement macOS UI reading")
+        """
+        正式读取：等待 engine_time 秒，然后返回 ([best_move], net_win)
+        """
+        time.sleep(float(getattr(self, "engine_time", 4.0)))
+        img = _screenshot_board()
+        best_moves, net_win = _analyze_board_best(img, debug_dir=None)
+        return best_moves, net_win

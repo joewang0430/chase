@@ -129,4 +129,35 @@ class Converters:
             if idx >= 0:
                 mask |= (1 << idx)
         return mask
+    
+    @staticmethod
+    def key_to_visual(key: str) -> str:
+        """Convert a stored key ("{black_hex}_{white_hex}_{side}") to a human readable board.
+
+        Format of key expected:
+            16-hex-digits '_' 16-hex-digits '_' side
+        side: 'B' or 'W' (black / white to move) – only used for an info line; it does
+        not affect the stone colors (●=black, ○=white) here.
+
+        If the key is malformed, returns a short error string.
+        """
+        if not isinstance(key, str):
+            return "<invalid key type>"
+        parts = key.strip().split('_')
+        if len(parts) != 3:
+            return f"<bad key format: {key}>"
+        black_hex, white_hex, side = parts
+        if len(black_hex) != 16 or len(white_hex) != 16:
+            return f"<bad hex length: {key}>"
+        try:
+            black = int(black_hex, 16)
+            white = int(white_hex, 16)
+        except ValueError:
+            return f"<bad hex digits: {key}>"
+        # Render board treating black as 'me' (●) and white as 'opp' (○)
+        board = Converters.bb_to_visual(black, white)
+        # Append side-to-move info (B/W) for clarity
+        side_info = side.upper() if side else '?'  # keep original if present
+        return board + f"\n(side to move: {side_info})"
+        
 

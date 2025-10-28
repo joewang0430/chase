@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-# 
+
+# cmd examples:
+# python3 auto/complete_bts.py --mock --limit 5
+# python3 auto/complete_bts.py --driver auto --limit 50
+# python3 auto/complete_bts.py --driver mac --time-budget 60
+# python3 -m auto.complete_bts --mock --limit 5
 
 """
 Simple filler: read full_book.jsonl -> update incomplete records -> overwrite same file.

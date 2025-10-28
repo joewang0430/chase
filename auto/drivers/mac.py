@@ -5,9 +5,57 @@ from typing import List, Tuple, Optional
 import subprocess
 import time
 import re
+import os
+import json
 from .base import SoftwareDriverBase
 
 APP_NAME = "Othello Sensei"
+CALIB_PATH = os.path.expanduser("~/.sensei_calib.json")  # 保存标定数据
+
+
+def _save_calib(data: dict) -> None:
+    os.makedirs(os.path.dirname(CALIB_PATH), exist_ok=True)
+    with open(CALIB_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+def _load_calib() -> dict:
+    # 如果标定文件不存在，给出清晰提示
+    if not os.path.exists(CALIB_PATH):
+        raise FileNotFoundError(
+            f"calibration not found: {CALIB_PATH}. Run with --probe-calibrate first."
+        )
+    with open(CALIB_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+    
+'''
+文件里存了什么
+JSON 字段：
+    app: "Othello Sensei"
+    board_rel: [bx, by, bw, bh]
+        含义：棋盘在应用窗口内的相对矩形，单位像素
+        bx,by 为棋盘左上角相对“窗口左上角”的偏移
+        bw,bh 为棋盘区域的宽高
+    运行时：实际点击坐标 = 窗口坐标 + board_rel 里的相对坐标
+'''
+
+# 把如 "d3" 的棋盘坐标转换为屏幕像素点(x,y)，使用 window 矩形(win=wx,wy,ww,wh)与棋盘相对矩形(board_rel=bx,by,bw,bh)，按 a1 左下、h8 右上的约定计算中心点
+def _coord_to_xy(coord: str, win: Tuple[int,int,int,int], board_rel: Tuple[int,int,int,int]) -> Tuple[int,int]:
+    # coord: "d3" 等；a1 左下，h8 右上
+    wx, wy, ww, wh = win
+    bx, by, bw, bh = board_rel
+    if len(coord) != 2:
+        raise ValueError(f"bad coord: {coord!r}")
+    col = coord[0].lower()
+    row = coord[1]
+    if not ('a' <= col <= 'h') or not ('1' <= row <= '8'):
+        raise ValueError(f"coord out of range: {coord!r}")
+    s = bw / 8.0  # 单格边长
+    c = ord(col) - ord('a')          # 列 0..7
+    r = int(row) - 1                 # 行 0..7（自上而下）
+    x = int(wx + bx + (c + 0.5) * s)
+    y = int(wy + by + (r + 0.5) * s)          # 屏幕 y 向下增大
+    return x, y
+    
 
 # 把那段 script 交给系统命令 osascript 执行。
 def _run_osa(script: str) -> str:
@@ -122,12 +170,56 @@ class MacDriver(SoftwareDriverBase):
             raise RuntimeError(f"Failed to detect window for '{APP_NAME}': {last_err}. {hint}")
         raise RuntimeError(f"Timed out waiting for '{APP_NAME}' window. {hint}")
 
-    # 新增：窗口截图探针，供 --probe-snap 使用
+    # 探针：窗口截图探针，供 --probe-snap 使用
     def snap_window(self, out_path: str) -> str:
         self.ensure_running()
         x, y, w, h = _get_window_bounds(APP_NAME)
         _snap_rect_png(x, y, w, h, out_path)
         return out_path
+    
+    # 标定：让用户依次指向“棋盘左上角”和“棋盘右下角”，按回车确认
+    # 引导你把鼠标依次放到“棋盘左上角、棋盘右下角”，按回车采样两点，计算出 board_rel 并写入 /Users/juanjuan1/.sensei_calib.json
+    def probe_calibrate(self) -> str:
+        import pyautogui  # 延迟导入
+        pyautogui.FAILSAFE = False
+        self.ensure_running()
+        wx, wy, ww, wh = _get_window_bounds(APP_NAME)
+        print("[CAL] 请把 Othello Sensei 置前台。")
+        input("[CAL] 把鼠标移动到 棋盘左上角 的边界上，按回车确认...")
+        tl = pyautogui.position()
+        input("[CAL] 把鼠标移动到 棋盘右下角 的边界上，按回车确认...")
+        br = pyautogui.position()
+        tlx, tly = tl.x, tl.y
+        brx, bry = br.x, br.y
+        bx, by = tlx - wx, tly - wy
+        bw, bh = brx - tlx, bry - tly
+        if bw <= 0 or bh <= 0:
+            raise ValueError(f"bad board rectangle: bw={bw}, bh={bh}")
+        data = {"app": APP_NAME, "board_rel": [int(bx), int(by), int(bw), int(bh)]}
+        _save_calib(data)
+        print(f"[CAL] saved to {CALIB_PATH}: board_rel={data['board_rel']}")
+        return CALIB_PATH
+    
+    # 试点点击：按棋盘坐标点击（例如 ["d3","e6"]）
+    # 读取标定文件与当前窗口位置，依次把 "d3","e6" 等转为像素并点击；"--" 跳过
+    def probe_click(self, coords: List[str], delay: float = 0.12) -> None:
+        import pyautogui
+        pyautogui.FAILSAFE = False
+        self.ensure_running()
+        cfg = _load_calib()
+        wx, wy, ww, wh = _get_window_bounds(APP_NAME)
+        board_rel = cfg.get("board_rel")
+        if not (isinstance(board_rel, list) and len(board_rel) == 4):
+            raise ValueError(f"bad calibration in {CALIB_PATH}: {board_rel!r}")
+        bx, by, bw, bh = board_rel
+        for c in coords:
+            c = c.strip()
+            if not c or c == "--":
+                time.sleep(delay)
+                continue
+            x, y = _coord_to_xy(c, (wx,wy,ww,wh), (bx,by,bw,bh))
+            pyautogui.click(x, y)
+            time.sleep(delay)
     
     def reset_board(self) -> None:
         # TODO: 回到初始局面（下一步实现）

@@ -130,23 +130,32 @@ def main():
     # 新增探针：只启动并截图，不触碰 JSONL
     ap.add_argument("--probe-open", action="store_true", help="just launch/activate target app and exit")
     ap.add_argument("--probe-snap", action="store_true", help="screenshot the app window to /tmp/othello_sensei.png and exit")
+    ap.add_argument("--probe-calibrate", action="store_true", help="calibrate board area (top-left and bottom-right)")  # 只做标定（创建/更新 ~/.sensei_calib.json），不触碰 JSONL，完成后直接退出
+    ap.add_argument("--probe-click", type=str, default=None, help="comma-separated squares to click, e.g. a1,d3,e6")    # 读取标定并在这些格子上试点点击，用于校验映射是否正确；不触碰 JSONL，完成后直接退出
+    
     args = ap.parse_args()
 
     # 探针操作：
-    if args.probe_open or args.probe_snap:
+    if args.probe_open or args.probe_snap or args.probe_calibrate or args.probe_click:
         d = create_driver(engine_time=4.0,
                           driver=args.driver,
                           mock=args.mock or (args.driver == "mock"))
         d.ensure_running()
+        did_any = False
         if args.probe_snap:
             out = "/tmp/othello_sensei.png"
-            # 只有 MacDriver 才有 snap_window；其它驱动忽略
             if hasattr(d, "snap_window"):
                 out = d.snap_window(out)
                 print(f"[SNAP] saved {out}")
             else:
                 print("[SNAP] not supported by this driver")
-        else:
+            did_any = True
+        if args.probe_calibrate and hasattr(d, "probe_calibrate"):
+            d.probe_calibrate(); did_any = True
+        if args.probe_click and hasattr(d, "probe_click"):
+            coords = [s.strip() for s in args.probe_click.split(",") if s.strip()]
+            d.probe_click(coords); did_any = True
+        if not did_any:
             print("[PROBE] ensure_running OK")
         return
 

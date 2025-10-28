@@ -126,7 +126,30 @@ def main():
     ap.add_argument("--driver", type=str, default="auto",
                     choices=["auto","mac","win","windows","linux","mock"])
     ap.add_argument("--mock", action="store_true", help="use mock driver (no real software)")
+    
+    # 新增探针：只启动并截图，不触碰 JSONL
+    ap.add_argument("--probe-open", action="store_true", help="just launch/activate target app and exit")
+    ap.add_argument("--probe-snap", action="store_true", help="screenshot the app window to /tmp/othello_sensei.png and exit")
     args = ap.parse_args()
+
+    # 探针操作：
+    if args.probe_open or args.probe_snap:
+        d = create_driver(engine_time=4.0,
+                          driver=args.driver,
+                          mock=args.mock or (args.driver == "mock"))
+        d.ensure_running()
+        if args.probe_snap:
+            out = "/tmp/othello_sensei.png"
+            # 只有 MacDriver 才有 snap_window；其它驱动忽略
+            if hasattr(d, "snap_window"):
+                out = d.snap_window(out)
+                print(f"[SNAP] saved {out}")
+            else:
+                print("[SNAP] not supported by this driver")
+        else:
+            print("[PROBE] ensure_running OK")
+        return
+
     process(limit=args.limit,
             time_budget=args.time_budget,
             mock=args.mock or (args.driver == "mock"),

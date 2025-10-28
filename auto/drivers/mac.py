@@ -4,6 +4,7 @@
 from typing import List, Tuple, Optional
 import subprocess
 import time
+import re
 from .base import SoftwareDriverBase
 
 APP_NAME = "Othello Sensei"
@@ -48,13 +49,57 @@ def _window_count(name: str) -> int:
         return int(out)
     except ValueError:
         return 0
+    
+def _get_window_bounds(name: str) -> Tuple[int, int, int, int]:
+    """
+    返回窗口矩形 (x, y, w, h)。对 osascript 的输出做鲁棒解析。
+    """
+    # 方案A：position + size
+    script_a = (
+        'tell application "System Events"\n'
+        f'  if not (exists process "{name}") then return "NA"\n'
+        f'  tell process "{name}"\n'
+        '    if not (exists window 1) then return "NA"\n'
+        '    set p to position of window 1\n'
+        '    set s to size of window 1\n'
+        '    return (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)\n'
+        '  end tell\n'
+        'end tell'
+    )
+    out = _run_osa(script_a)
+    nums = re.findall(r'-?\d+', out)
+    if len(nums) < 4:
+        # 方案B：直接读 bounds（有的系统更稳定）
+        script_b = (
+            'tell application "System Events"\n'
+            f'  if not (exists process "{name}") then return "NA"\n'
+            f'  tell process "{name}"\n'
+            '    if not (exists window 1) then return "NA"\n'
+            '    set b to bounds of window 1 -- {x,y,w,h}\n'
+            '    return (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 4 of b)\n'
+            '  end tell\n'
+            'end tell'
+        )
+        out = _run_osa(script_b)
+        nums = re.findall(r'-?\d+', out)
+
+    if len(nums) < 4:
+        raise RuntimeError(f"window bounds parse failed: {out!r}")
+    x, y, w, h = map(int, nums[:4])
+    return x, y, w, h
+    
+def _snap_rect_png(x: int, y: int, w: int, h: int, out_path: str) -> None:
+    # 用系统截图工具截取矩形区域（需要屏幕录制权限）
+    subprocess.run(["screencapture", "-x", "-R", f"{x},{y},{w},{h}", out_path], check=True)
+    
+# ---------------------------------------- Mac Driver
 
 class MacDriver(SoftwareDriverBase):
     def ensure_running(self) -> None:
         # 1) 启动（如未运行）
         if not _app_is_running(APP_NAME):
             _launch_app(APP_NAME)
-    
+
         # 2) 激活到前台
         _activate_app(APP_NAME)
 
@@ -77,8 +122,15 @@ class MacDriver(SoftwareDriverBase):
             raise RuntimeError(f"Failed to detect window for '{APP_NAME}': {last_err}. {hint}")
         raise RuntimeError(f"Timed out waiting for '{APP_NAME}' window. {hint}")
 
+    # 新增：窗口截图探针，供 --probe-snap 使用
+    def snap_window(self, out_path: str) -> str:
+        self.ensure_running()
+        x, y, w, h = _get_window_bounds(APP_NAME)
+        _snap_rect_png(x, y, w, h, out_path)
+        return out_path
+    
     def reset_board(self) -> None:
-        # TODO: 复位到初始局面
+        # TODO: 回到初始局面（下一步实现）
         return
 
     def replay_moves(self, moves_played: List[str]) -> None:

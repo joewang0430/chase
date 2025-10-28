@@ -25,12 +25,13 @@ import time
 import json
 import argparse
 import shutil
-from typing import List, Tuple, Optional
+from typing import List, Optional
 
 ROOT = os.path.dirname(os.path.dirname(__file__))  # /Users/.../chase
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-from auto.software_driver import SoftwareDriver
+from auto.drivers import create_driver
+
 BOOK_DIR = os.path.join(ROOT, "book")
 INPUT_PATH = os.path.join(BOOK_DIR, "full_book.jsonl")
 BACKUP_PATH = INPUT_PATH + ".bak"
@@ -39,18 +40,18 @@ BACKUP_PATH = INPUT_PATH + ".bak"
 def needs_work(obj: dict) -> bool:
     return (not obj.get("best_moves")) or (obj.get("net_win", None) is None)
 
-def process(limit: Optional[int], time_budget: Optional[float], mock: bool) -> None:
+def process(limit: Optional[int], time_budget: Optional[float], mock: bool, driver_name: Optional[str]) -> None:
     if not os.path.exists(INPUT_PATH):
         print(f"[ERR] input not found: {INPUT_PATH}", file=sys.stderr) 
         sys.exit(1)
     
     start = time.time()
     deadline = start + time_budget if time_budget is not None else None
-    updated = 0                     # 含义：已读并处理的记录行数（无论是否更新）。何时加一：每读到一行合法 JSON 就加一。遇到空行/坏行也会把它计入并原样写回。
-    processed = 0                   # 含义：本次真正“填充成功”的记录数。何时加一：当 needs_work 为真且未触达 limit/未超时，并且 SoftwareDriver.solve 成功返回后，把 best_moves/net_win 写入该行时加一。
+    updated = 0                     # 含义：本次真正“填充成功”的记录数。何时加一：当 needs_work 为真且未触达 limit/未超时，并且 SoftwareDriver.solve 成功返回后，把 best_moves/net_win 写入该行时加一。
+    processed = 0                   # 含义：已读并处理的记录行数（无论是否更新）。何时加一：每读到一行合法 JSON 就加一。遇到空行/坏行也会把它计入并原样写回。
     out_lines: List[str] = []       # 含义：待写回文件的字符串列表（保持与输入同顺序）。内容：对每一行，若更新了则存更新后的 JSON 字符串；若未更新或解析失败则存原始行。
 
-    driver = SoftwareDriver(engine_time=4.0, mock=mock)
+    driver = create_driver(engine_time=4.0, driver=driver_name, mock=mock)
     
     # 读取整本 -> 在线更新 -> 收集为 out_lines
     with open(INPUT_PATH, "r", encoding="utf-8") as fin:
@@ -116,9 +117,14 @@ def main():
     ap = argparse.ArgumentParser(description="Fill best_moves and net_win into full_book.jsonl (simple overwrite)")
     ap.add_argument("--limit", type=int, default=None, help="max records to update in this run")
     ap.add_argument("--time-budget", type=float, default=None, help="seconds budget for this run")
+    ap.add_argument("--driver", type=str, default="auto",
+                    choices=["auto","mac","win","windows","linux","mock"])
     ap.add_argument("--mock", action="store_true", help="use mock driver (no real software)")
     args = ap.parse_args()
-    process(limit=args.limit, time_budget=args.time_budget, mock=args.mock)
+    process(limit=args.limit,
+            time_budget=args.time_budget,
+            mock=args.mock or (args.driver == "mock"),
+            driver_name=args.driver)
 
 if __name__ == "__main__":
     main()

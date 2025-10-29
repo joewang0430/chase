@@ -150,7 +150,7 @@ def main():
         or args.probe_calibrate_nav or args.probe_calibrate_yes or args.probe_reset
         or args.probe_read):
         d = create_driver(engine_time=4.0, driver=args.driver, mock=args.mock or (args.driver == "mock"))
-        d.ensure_running()
+        # d.ensure_running()
         did_any = False
         if args.probe_snap and hasattr(d, "snap_window"):
             out = "/tmp/othello_sensei.png"; out = d.snap_window(out); print(f"[SNAP] saved {out}"); did_any = True

@@ -496,6 +496,8 @@ def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],
     import cv2
     import pytesseract
 
+    # t_ocr = time.perf_counter() # TEST
+
     img_rgb = np.array(img_pil.convert("RGB"))
     H, W = img_rgb.shape[:2]
     x0, y0, x1, y1 = cell_rect
@@ -578,6 +580,7 @@ def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],
 
             # 成功解析为数值
             if val is not None:
+                # print(f"[T] ocr[{tag}] success: {(time.perf_counter()-t_ocr)*1000:.0f} ms, text={s!r}") # TEST
                 if debug_dir:
                     try:
                         os.makedirs(debug_dir, exist_ok=True)
@@ -602,6 +605,7 @@ def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],
         except Exception:
             pass
 
+    # print(f"[T] ocr[{tag}] fail: {(time.perf_counter()-t_ocr)*1000:.0f} ms, last_raw={best_raw!r}") # TEST
     return None, best_raw
 
 def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None) -> Tuple[List[str], float]:
@@ -700,7 +704,8 @@ class MacDriver(SoftwareDriverBase):
             raise RuntimeError(f"Timed out waiting for '{APP_NAME}' window. {hint}")
 
         # 4) 稍等布局稳定再调整大小
-        time.sleep(0.35)
+        # time.sleep(0.35)
+        time.sleep(0.15)
         _maximize_window_to_screen(APP_NAME, retries=6, interval=0.35, inset_bottom=0)
 
         # 5) 等待尺寸稳定：连续检测 N 次相同/接近的 bounds
@@ -814,12 +819,24 @@ class MacDriver(SoftwareDriverBase):
         """
         截取棋盘 -> 识别黄色最佳点 -> 打印并保存调试图到 /tmp/sensei_read_<ts>/
         """
+        t_total = time.perf_counter()
+        t0 = time.perf_counter()
         self.ensure_running()
+        print(f"[T] ensure_running: {(time.perf_counter()-t0)*1000:.0f} ms")
+
         # 等待一点时间让评估稳定（用 engine_time；没有就默认 4s）
         time.sleep(float(getattr(self, "engine_time", 4.0)))
+
+        t0 = time.perf_counter()
         img = _screenshot_board()
+        print(f"[T] screenshot: {(time.perf_counter()-t0)*1000:.0f} ms")
+
+        t0 = time.perf_counter()
         tsdir = f"/tmp/sensei_read_{int(time.time())}"
         best_moves, net_win = _analyze_board_best(img, debug_dir=tsdir)
+        print(f"[T] analyze(OCR): {(time.perf_counter()-t0)*1000:.0f} ms")
+        print(f"[T] total probe_read: {(time.perf_counter()-t_total):.2f} s")
+
         print(f"[READ] best_moves={best_moves} net_win={net_win:.2f}")
         print(f"[READ] debug saved to {tsdir}")
         return best_moves, net_win
@@ -827,7 +844,7 @@ class MacDriver(SoftwareDriverBase):
     def reset_board(self) -> None:
         import pyautogui
         pyautogui.FAILSAFE = False
-        self.ensure_running()
+        # self.ensure_running()
         cfg = _load_calib()
         nav = cfg.get("nav_reset_rel")
         if not (isinstance(nav, list) and len(nav) == 2):
@@ -861,7 +878,7 @@ class MacDriver(SoftwareDriverBase):
         # 依次点子；"--" 跳过
         import pyautogui
         pyautogui.FAILSAFE = False
-        self.ensure_running()
+        # self.ensure_running()
         cfg = _load_calib()
         board_rel = cfg.get("board_rel")
         if not (isinstance(board_rel, list) and len(board_rel) == 4):

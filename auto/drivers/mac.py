@@ -495,16 +495,15 @@ def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],
     import numpy as np
     import cv2
     import pytesseract
-    import re
 
     img_rgb = np.array(img_pil.convert("RGB"))
     H, W = img_rgb.shape[:2]
     x0, y0, x1, y1 = cell_rect
 
-    # 左侧适当加 padding，尽量保住 +/- 号
-    pad_left, pad_top, pad_right, pad_bottom = 6, 4, 4, 4
-    x0p = max(0, x0 - pad_left); y0p = max(0, y0 - pad_top)
-    x1p = min(W, x1 + pad_right); y1p = min(H, y1 + pad_bottom)
+    # padding 设置（目前不要）
+    # 不加 padding：使用与 vis 黄色框完全一致的区域
+    x0p = max(0, x0); y0p = max(0, y0)
+    x1p = min(W, x1); y1p = min(H, y1)
 
     roi = img_rgb[y0p:y1p, x0p:x1p]
     if roi.size == 0:
@@ -551,6 +550,10 @@ def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],
             try:
                 val = _parse_signed_digits_to_value(s)
             except RuntimeError as e:
+                msg = str(e)
+                # 仅对“格式不匹配”放行并保存；超范围等其他错误直接抛出终止
+                if "Invalid OCR numeric format" not in msg:
+                    raise
                 # 保存发生格式错误的样本，继续尝试其它预处理/配置
                 if debug_dir:
                     try:

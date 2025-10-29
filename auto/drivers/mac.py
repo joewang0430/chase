@@ -54,8 +54,78 @@ JSON 字段：
     运行时：实际点击坐标 = 窗口坐标 + board_rel 里的相对坐标
 '''
 
-def _maximize_window_to_screen(name: str, retries: int = 8, interval: float = 0.35) -> None:
-    pass
+def _maximize_window_to_screen(name: str, retries: int = 6, interval: float = 0.4, inset_bottom: int = 0) -> None:
+    """
+    把指定应用的前置窗口调整为“占满桌面可视区域”的大小（不进入 macOS 的 Full Screen / Space）。
+    - 使用 System Events 设置 window position/size（不会创建独立 Space）。
+    - retries/interval：失败重试次数与间隔。
+    - inset_bottom：向上保留的底部像素（例如避开 Dock，若不需要设为0）。
+    不抛异常，超时会打印 [WARN]。
+    """
+    import time
+    try:
+        # 读主屏宽高与菜单栏高度（鲁棒：若读取失败用默认）
+        script = '''
+        tell application "Finder" to set db to bounds of window of desktop
+        set screenW to item 3 of db
+        set screenH to item 4 of db
+        set mbH to 22
+        try
+          tell application "System Events"
+            set mbSize to size of menu bar 1 of application process "SystemUIServer"
+            set mbH to item 2 of mbSize
+          end tell
+        end try
+        return screenW & "," & screenH & "," & mbH
+        '''
+        out = _run_osa(script)
+        nums = [int(n) for n in re.findall(r'\d+', out)]
+        if len(nums) >= 3:
+            screenW, screenH, mbH = nums[0], nums[1], nums[2]
+        else:
+            screenW, screenH, mbH = 1440, 900, 22
+    except Exception:
+        screenW, screenH, mbH = 1440, 900, 22
+
+    target_x = 0
+    target_y = mbH
+    target_w = int(screenW)
+    target_h = int(max(0, screenH - mbH - int(inset_bottom)))
+
+    last_err = ""
+    for _ in range(max(1, int(retries))):
+        try:
+            # 设置窗口 position/size（不触碰 AXFullScreen）
+            set_script = (
+                'tell application "System Events"\n'
+                f'  if not (exists process "{name}") then return "NA"\n'
+                f'  tell process "{name}"\n'
+                '    try\n'
+                f'      set position of window 1 to {{{target_x}, {target_y}}}\n'
+                f'      set size of window 1 to {{{target_w}, {target_h}}}\n'
+                '    end try\n'
+                '  end tell\n'
+                'end tell\n'
+            )
+            try:
+                _run_osa(set_script)
+            except Exception as e:
+                last_err = str(e)
+
+            # 读取当前窗口 bounds 并判断是否接近目标（容差若干像素）
+            try:
+                wx, wy, ww, wh = _get_window_bounds(name)
+                tol = 200
+                if abs(wx - target_x) <= tol and abs(wy - target_y) <= tol and abs(ww - target_w) <= tol and abs(wh - target_h) <= tol:
+                    return
+                last_err = f"bounds={wx},{wy},{ww},{wh}"
+            except Exception as e:
+                last_err = str(e)
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(float(interval))
+
+    print(f"[WARN] _maximize_window_to_screen: failed to size window for '{name}' after {retries} tries (last={last_err!r})")
 
 def _dismiss_new_game_prompt(name: str) -> bool:
     """
@@ -173,9 +243,20 @@ def _window_count(name: str) -> int:
     
 def _get_window_bounds(name: str) -> Tuple[int, int, int, int]:
     """
-    返回窗口矩形 (x, y, w, h)。对 osascript 的输出做鲁棒解析。
+    返回窗口矩形 (x, y, w, h)。
+
+    逻辑：
+      - 优先用 position + size 接口（脚本 A），若返回有效则直接返回 x,y,w,h；
+      - 否则用 bounds 接口（脚本 B），bounds 返回 left,top,right,bottom，
+        转换为 x=left,y=top,w=right-left,h=bottom-top；
+      - 重试若干次以容忍窗口创建/布局抖动；失败时输出诊断信息并抛错。
     """
-    # 方案A：position + size
+    def try_osa(script: str) -> Optional[str]:
+        try:
+            return _run_osa(script)
+        except Exception:
+            return None
+
     script_a = (
         'tell application "System Events"\n'
         f'  if not (exists process "{name}") then return "NA"\n'
@@ -187,27 +268,57 @@ def _get_window_bounds(name: str) -> Tuple[int, int, int, int]:
         '  end tell\n'
         'end tell'
     )
-    out = _run_osa(script_a)
-    nums = re.findall(r'-?\d+', out)
-    if len(nums) < 4:
-        # 方案B：直接读 bounds（有的系统更稳定）
-        script_b = (
+
+    script_b = (
+        'tell application "System Events"\n'
+        f'  if not (exists process "{name}") then return "NA"\n'
+        f'  tell process "{name}"\n'
+        '    if not (exists window 1) then return "NA"\n'
+        '    set b to bounds of window 1\n'
+        '    return (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 4 of b)\n'
+        '  end tell\n'
+        'end tell'
+    )
+
+    last_out = None
+    for _ in range(4):
+        out = try_osa(script_a)
+        if out and out != "NA":
+            nums = re.findall(r'-?\d+', out)
+            if len(nums) >= 4:
+                x, y, w, h = map(int, nums[:4])
+                return x, y, w, h
+        out = try_osa(script_b)
+        if out and out != "NA":
+            nums = re.findall(r'-?\d+', out)
+            if len(nums) >= 4:
+                left, top, right, bottom = map(int, nums[:4])
+                w = right - left
+                h = bottom - top
+                return left, top, w, h
+        last_out = out
+        time.sleep(0.20)
+
+    # 诊断信息
+    probe = {}
+    try:
+        probe["app_running"] = try_osa(f'application "{name}" is running as boolean')
+    except Exception as e:
+        probe["app_running"] = f"err:{e}"
+    try:
+        probe["window_count"] = try_osa(
             'tell application "System Events"\n'
-            f'  if not (exists process "{name}") then return "NA"\n'
-            f'  tell process "{name}"\n'
-            '    if not (exists window 1) then return "NA"\n'
-            '    set b to bounds of window 1 -- {x,y,w,h}\n'
-            '    return (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 4 of b)\n'
-            '  end tell\n'
+            f'  if exists process "{name}" then return (count of windows of process "{name}")\n'
+            '  else return "0"\n'
             'end tell'
         )
-        out = _run_osa(script_b)
-        nums = re.findall(r'-?\d+', out)
+    except Exception as e:
+        probe["window_count"] = f"err:{e}"
 
-    if len(nums) < 4:
-        raise RuntimeError(f"window bounds parse failed: {out!r}")
-    x, y, w, h = map(int, nums[:4])
-    return x, y, w, h
+    raise RuntimeError(
+        f"window bounds parse failed: last_out={last_out!r}; probe={probe!r}. "
+        "Ensure app is running, window exists, and Accessibility (Privacy) is granted to your Terminal/IDE."
+    )
     
 def _snap_rect_png(x: int, y: int, w: int, h: int, out_path: str) -> None:
     # 用系统截图工具截取矩形区域（需要屏幕录制权限）
@@ -505,33 +616,77 @@ def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None)
     
 # ---------------------------------------- Mac Driver
 
+# ...existing code...
 class MacDriver(SoftwareDriverBase):
     def ensure_running(self) -> None:
+        """
+        启动/激活应用并把窗口调整为“占满桌面可视区域”（非 Full Screen）。
+        流程：
+          1) 若未运行则 open -a 启动
+          2) activate 到前台
+          3) 等待窗口出现（最多 10s）
+          4) 调用 _maximize_window_to_screen（重试内部控制）
+          5) 等待窗口尺寸稳定（连续多次相同或接近）
+        抛出：若在等待窗口出现阶段超时会抛 RuntimeError（提示 Accessibility 权限等）。
+        """
         # 1) 启动（如未运行）
         if not _app_is_running(APP_NAME):
             _launch_app(APP_NAME)
 
-        # 2) 激活到前台
+        # 2) 激活（置前）
         _activate_app(APP_NAME)
 
-        # 3) 等待至少出现一个窗口（最多等待 ~10 秒）
+        # 3) 等待窗口出现（最多 10s）
         deadline = time.time() + 10.0
         last_err: Optional[str] = None
         while time.time() < deadline:
             try:
                 if _window_count(APP_NAME) > 0:
-                    return
+                    break
             except Exception as e:
                 last_err = str(e)
-            time.sleep(0.2)
+            time.sleep(0.18)
+        else:
+            hint = (
+                "If this is the first run or permissions changed, grant Accessibility: "
+                "System Settings > Privacy & Security > Accessibility, add your Terminal/IDE."
+            )
+            if last_err:
+                raise RuntimeError(f"Failed to detect window for '{APP_NAME}': {last_err}. {hint}")
+            raise RuntimeError(f"Timed out waiting for '{APP_NAME}' window. {hint}")
 
-        hint = (
-            "If this is the first run or permissions changed, grant Accessibility: "
-            "System Settings > Privacy & Security > Accessibility, add your Terminal/VS Code."
-        )
-        if last_err:
-            raise RuntimeError(f"Failed to detect window for '{APP_NAME}': {last_err}. {hint}")
-        raise RuntimeError(f"Timed out waiting for '{APP_NAME}' window. {hint}")
+        # 4) 稍等布局稳定再调整大小
+        time.sleep(0.35)
+        _maximize_window_to_screen(APP_NAME, retries=6, interval=0.35, inset_bottom=0)
+
+        # 5) 等待尺寸稳定：连续检测 N 次相同/接近的 bounds
+        stable_deadline = time.time() + 4.0
+        last_bounds = None
+        same_count = 0
+        tol = 200
+        while time.time() < stable_deadline:
+            try:
+                b = _get_window_bounds(APP_NAME)
+            except Exception:
+                b = None
+            if b is None:
+                same_count = 0
+            else:
+                if last_bounds is None:
+                    last_bounds = b
+                    same_count = 1
+                else:
+                    if all(abs(b[i] - last_bounds[i]) <= tol for i in range(4)):
+                        same_count += 1
+                    else:
+                        last_bounds = b
+                        same_count = 1
+            if same_count >= 3:
+                return
+            time.sleep(0.18)
+
+        # 未完全稳定但已尽力：打印警告，不抛以免阻断后续 probe 操作
+        print(f"[WARN] ensure_running: window for '{APP_NAME}' not confirmed stable after attempts (last_bounds={last_bounds})")
 
     # 探针：窗口截图探针，供 --probe-snap 使用
     def snap_window(self, out_path: str) -> str:

@@ -445,12 +445,7 @@ def _parse_signed_digits_to_value(text: str) -> float:
       - 去掉空格后，字符串必须严格匹配：^[+-][0-9]{3,4}$ （即一个 ASCII 符号后跟 3 或 4 个数字）
       - 支持把常见的长/短横、Unicode 加号规范为 ASCII '+'/'-' 后再检测
       - 若不匹配则直接抛出 RuntimeError（程序会终止）
-    示例：
-      "+2811" -> 28.11
-      "+092"  -> 0.92
-      "-1024" -> -10.24
-      "+000"  -> 0.00
-      "-789"  -> -7.89
+      - 解析后若绝对值超过 64 则视为错误并抛出 RuntimeError
     """
     import re
 
@@ -461,8 +456,7 @@ def _parse_signed_digits_to_value(text: str) -> float:
 
     # 规范化各种加号/减号到 ASCII
     s = s.replace("\u2212", "-").replace("\u2013", "-").replace("\u2014", "-")  # − – —
-    s = s.replace("＋", "+").replace("﹢", "+").replace("＋", "+")
-    # 明确要求 ASCII +/-：不要中文符号等
+    s = s.replace("＋", "+").replace("﹢", "+")
     # 去掉所有空格
     s_nospace = "".join(ch for ch in s if not ch.isspace())
 
@@ -477,12 +471,16 @@ def _parse_signed_digits_to_value(text: str) -> float:
     sign = -1.0 if sign_char == "-" else 1.0
     digits = s_nospace[1:]  # 3 or 4 digits guaranteed by regex
 
-    # 按两位小数还原
+    # 按两位小数还原并做范围校验
     try:
-        return sign * (int(digits) / 100.0)
+        val = sign * (int(digits) / 100.0)
     except Exception as e:
-        # 不太可能到这里，但以防万一返回更明确错误
         raise RuntimeError(f"Failed to parse digits '{digits}' from OCR text {text!r}: {e}")
+
+    if abs(val) > 64.0:
+        raise RuntimeError(f"Parsed value out of allowed range [-64,64]: {val} from OCR text {text!r}")
+
+    return val
 
 
 def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],

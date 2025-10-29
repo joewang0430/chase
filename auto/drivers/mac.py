@@ -490,6 +490,9 @@ def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],
     """
     对单个棋格的“原图整格”做 OCR（仅识别 +- 与数字），返回 (value or None, raw_text)。
     小数点不参与识别；按两位小数固定格式还原：value = sign * int(digits) / 100.
+    若 _parse_signed_digits_to_value 抛出格式错误（RuntimeError），此函数会把该预处理结果
+    (图片 + 原始文本 + 报错信息) 存为 cell_{tag}_badfmt.* 到 debug_dir，并继续尝试其它预处理。
+    最终若全部尝试失败，仍会按原流程保存最后一次图与文本。
     """
     import numpy as np
     import cv2
@@ -545,10 +548,35 @@ def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],
         img2 = cv2.dilate(img, k, iterations=1)  # 仅1次，避免吃掉负号
         for cfg in cfgs:
             s = pytesseract.image_to_string(img2, config=cfg).strip()
-            val = _parse_signed_digits_to_value(s)
             last_img = img2
+            # 尝试解析，若格式不对 _parse_signed_digits_to_value 会抛 RuntimeError
+            try:
+                val = _parse_signed_digits_to_value(s)
+            except RuntimeError as e:
+                # 保存发生格式错误的样本，继续尝试其它预处理/配置
+                if debug_dir:
+                    try:
+                        os.makedirs(debug_dir, exist_ok=True)
+                        bad_img_path = os.path.join(debug_dir, f"cell_{tag}_badfmt.png")
+                        bad_txt_path = os.path.join(debug_dir, f"cell_{tag}_badfmt.txt")
+                        cv2.imwrite(bad_img_path, img2)
+                        with open(bad_txt_path, "w", encoding="utf-8") as f:
+                            f.write(f"raw_text: {s!r}\n\nparse_error: {str(e)}\n")
+                        print(f"[WARN] OCR bad-format saved: {bad_img_path}, {bad_txt_path}")
+                    except Exception:
+                        pass
+                # 记录最后一次原始文本并继续
+                if s:
+                    best_raw = s
+                continue
+            except Exception:
+                # 其他异常按失败处理，继续尝试
+                if s:
+                    best_raw = s
+                continue
+
+            # 成功解析为数值
             if val is not None:
-                # 调试保存
                 if debug_dir:
                     try:
                         os.makedirs(debug_dir, exist_ok=True)
@@ -558,6 +586,7 @@ def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],
                     except Exception:
                         pass
                 return float(val), s
+
             # 记录最后一次原始文本
             if s:
                 best_raw = s

@@ -54,6 +54,9 @@ JSON 字段：
     运行时：实际点击坐标 = 窗口坐标 + board_rel 里的相对坐标
 '''
 
+def _maximize_window_to_screen(name: str, retries: int = 8, interval: float = 0.35) -> None:
+    pass
+
 def _dismiss_new_game_prompt(name: str) -> bool:
     """
     尝试关闭“New game?”提示。返回 True 表示做了动作（点了按钮或发回车）。
@@ -118,11 +121,12 @@ def _coord_to_xy(coord: str, win: Tuple[int,int,int,int], board_rel: Tuple[int,i
     row = coord[1]
     if not ('a' <= col <= 'h') or not ('1' <= row <= '8'):
         raise ValueError(f"coord out of range: {coord!r}")
-    s = bw / 8.0  # 单格边长
+    cell_w = bw / 8.0
+    cell_h = bh / 8.0
     c = ord(col) - ord('a')          # 列 0..7
     r = int(row) - 1                 # 行 0..7（自上而下）
-    x = int(wx + bx + (c + 0.5) * s)
-    y = int(wy + by + (r + 0.5) * s)          # 屏幕 y 向下增大
+    x = int(wx + bx + (c + 0.5) * cell_w)
+    y = int(wy + by + (r + 0.5) * cell_h)   # 屏幕 y 向下增大
     return x, y
     
 
@@ -242,160 +246,259 @@ def _xy_to_coord_local(x: float, y: float, w: int, h: int) -> str:
     r = int(max(0, min(7, y // cell_h)))   # 0..7 上→下
     return f"{chr(ord('a') + c)}{r + 1}"
 
-def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None) -> Tuple[List[str], float]:
+def _detect_best_cells_by_mask(
+    img_pil: "Image.Image",
+    top_k: Optional[int] = None,          # None/0 = 不限数量
+    rel_tol: float = 0.5,                 # 不限数量时，保留 ≥ max_area * rel_tol 的格
+    min_area: int = 8,                    # 绝对像素下限，过滤噪声
+    debug_dir: Optional[str] = None
+) -> Tuple[List[Tuple[str, int, Tuple[int,int,int,int]]], "np.ndarray"]:
     """
-    基于棋盘截图，定位黄色最佳点，OCR 读数值。
-    返回 ([best_move], net_win)。a1 左上，h8 右下。
+    用黄色掩码在整盘上定位“黄色最多”的格（不做 OCR）。
+    返回：
+      - candidates: [(coord, area, (x0,y0,x1,y1))]，按面积降序；
+        若 top_k 为 None/0：返回所有面积≥max_area*rel_tol 且 ≥min_area 的格；
+        若 top_k 为正：返回前 top_k，并把与第 top_k 名面积接近的并列项也一起返回。
+      - mask: HSV 阈值后的二值掩码
     """
     import numpy as np
     import cv2
-    import pytesseract
     from PIL import Image
 
-    # 1) 转 OpenCV 图像并做黄色分割
-    img_rgb = np.array(img_pil.convert("RGB"))  # HxWx3, RGB
+    img_rgb = np.array(img_pil.convert("RGB"))
     H, W = img_rgb.shape[:2]
     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
-    # 黄色阈值（适度放宽）
+    # 适度放宽，仅用于定位
     lower = (12, 80, 150)   # H,S,V
     upper = (60, 255, 255)
     mask = cv2.inRange(hsv, lower, upper)
 
-    # 形态学：先闭运算连通，再轻微膨胀
+    # 连通/填补：闭运算 + 轻微膨胀
     k = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
     mask = cv2.dilate(mask, np.ones((2, 2), np.uint8), iterations=1)
 
-    # 2) 连通域候选
-    num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    candidates = []
-    for i in range(1, num):
-        x, y, w, h, area = stats[i]
-        if area < 12:  # 放低面积门槛
-            continue
-        cx, cy = centroids[i]
-        pad = 3  # 适度放大候选框
-        x0 = max(0, x - pad); y0 = max(0, y - pad)
-        x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
-        candidates.append((x0, y0, x1, y1, cx, cy, area))
+    # 统计每个棋格的黄像素面积
+    cell_w = W / 8.0
+    cell_h = H / 8.0
+    scores: List[Tuple[str, int, Tuple[int,int,int,int]]] = []
+    for r in range(8):
+        for c in range(8):
+            x0 = int(c * cell_w); x1 = int((c + 1) * cell_w)
+            y0 = int(r * cell_h); y1 = int((r + 1) * cell_h)
+            area = int((mask[y0:y1, x0:x1] > 0).sum())
+            if area < min_area:
+                continue
+            coord = f"{chr(ord('a') + c)}{r + 1}"
+            scores.append((coord, area, (x0, y0, x1, y1)))
 
-    if not candidates:
+    if not scores:
         if debug_dir:
             os.makedirs(debug_dir, exist_ok=True)
             Image.fromarray(img_rgb).save(os.path.join(debug_dir, "sensei_board.png"))
             cv2.imwrite(os.path.join(debug_dir, "sensei_mask.png"), mask)
-        raise RuntimeError("no yellow candidates found; adjust color threshold or ensure highlights are visible")
+        return [], mask
 
-    # 3) 对候选框做 OCR（多种预处理与配置尝试）
-    results = []
-    try_cfgs = [
-        "--psm 7 -c tessedit_char_whitelist=+-0123456789.",
-        "--psm 6 -c tessedit_char_whitelist=+-0123456789.",
-        "--psm 8 -c tessedit_char_whitelist=+-0123456789.",
-    ]
-    roi_idx = 0
-    for x0, y0, x1, y1, cx, cy, area in candidates:
-        # 仅保留黄色前景，去掉背景
-        roi_rgb = img_rgb[y0:y1, x0:x1]
-        roi_mask = mask[y0:y1, x0:x1]
-        fg = cv2.bitwise_and(roi_rgb, roi_rgb, mask=roi_mask)
+    scores.sort(key=lambda t: t[1], reverse=True)
+    max_area = scores[0][1]
 
-        # 灰度 + OTSU 二值（白底黑字）
-        gray = cv2.cvtColor(fg, cv2.COLOR_RGB2GRAY)
-        bin1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-        bin_inv = 255 - bin1
-        bin_inv = cv2.dilate(bin_inv, np.ones((2, 2), np.uint8), iterations=1)
-        up = cv2.resize(bin_inv, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST)
+    if not top_k:  # 不限数量：保留与最大值相对接近者
+        thresh = max(min_area, int(max_area * rel_tol))
+        candidates = [s for s in scores if s[1] >= thresh]
+    else:
+        top_k = max(1, int(top_k))
+        base = scores[:top_k]
+        # 与第 top_k 名接近的并列也包含（±2% 或 ±2 像素取较大）
+        last_area = base[-1][1]
+        tie_tol = max(2, int(0.02 * max_area))
+        extra = [s for s in scores[top_k:] if s[1] >= last_area - tie_tol]
+        candidates = base + extra
 
-        txt = ""
-        num_match = None
-        for cfg in try_cfgs:
-            s = pytesseract.image_to_string(up, config=cfg).strip()
-            m = re.search(r'[+-]?\d+(?:\.\d+)?', s)
-            if m:
-                txt = s
-                num_match = m
-                break
-
-        # 若失败，换自适应阈值再试
-        if num_match is None:
-            bin2 = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5
-            )
-            bin2 = cv2.dilate(bin2, np.ones((2, 2), np.uint8), iterations=1)
-            up2 = cv2.resize(bin2, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST)
-            for cfg in try_cfgs:
-                s = pytesseract.image_to_string(up2, config=cfg).strip()
-                m = re.search(r'[+-]?\d+(?:\.\d+)?', s)
-                if m:
-                    txt = s
-                    num_match = m
-                    up = up2
-                    break
-
-        if num_match is None:
-            if debug_dir:
-                os.makedirs(debug_dir, exist_ok=True)
-                cv2.imwrite(os.path.join(debug_dir, f"roi_{roi_idx:02d}_gray.png"), gray)
-                cv2.imwrite(os.path.join(debug_dir, f"roi_{roi_idx:02d}_bin.png"), bin1)
-                cv2.imwrite(os.path.join(debug_dir, f"roi_{roi_idx:02d}_up.png"), up)
-            roi_idx += 1
-            continue
-
-        try:
-            val = float(num_match.group(0))
-        except ValueError:
-            if debug_dir:
-                os.makedirs(debug_dir, exist_ok=True)
-                with open(os.path.join(debug_dir, f"roi_{roi_idx:02d}_raw.txt"), "w", encoding="utf-8") as f:
-                    f.write(txt)
-            roi_idx += 1
-            continue
-
-        coord = _xy_to_coord_local(cx, cy, W, H)
-        results.append((coord, val, (x0, y0, x1, y1), (cx, cy)))
-
-        if debug_dir:
-            os.makedirs(debug_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(debug_dir, f"roi_{roi_idx:02d}_ok.png"), up)
-        roi_idx += 1
-
-    if not results:
-        if debug_dir:
-            os.makedirs(debug_dir, exist_ok=True)
-            Image.fromarray(img_rgb).save(os.path.join(debug_dir, "sensei_board.png"))
-            cv2.imwrite(os.path.join(debug_dir, "sensei_mask.png"), mask)
-        raise RuntimeError("OCR got no usable numbers from yellow candidates")
-
-    # 4) 合并同格，选取最佳
-    merged: dict = {}
-    for coord, val, box, ctr in results:
-        if coord not in merged or val > merged[coord][0]:
-            merged[coord] = (val, box, ctr)
-
-    pairs = [(c, v[0]) for c, v in merged.items()]
-    pairs.sort(key=lambda t: t[1], reverse=True)
-    best_val = pairs[0][1]
-    tied = [p for p in pairs if abs(p[1] - best_val) <= 0.1 + 1e-9]
-    tied.sort(key=lambda t: t[0])
-    best_move = tied[0][0]
-    net_win = float(best_val)
-
+    # 调试输出
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
+        Image.fromarray(img_rgb).save(os.path.join(debug_dir, "sensei_board.png"))
+        cv2.imwrite(os.path.join(debug_dir, "sensei_mask.png"), mask)
+
+    # 控制台打印候选坐标（按面积降序）
+    print("[MASK] candidates:", [c for c, _, _ in candidates])
+
+    return candidates, mask
+
+def _parse_signed_digits_to_value(text: str) -> Optional[float]:
+    """
+    仅从文本中提取“[+/-] 与数字”，忽略小数点。
+    - 符号规则：出现任何减号(−/–/—/-)即认为是负，否则一律为正（即使'+'被识别错）。
+    - 数字规则：拼接所有数字后仅取末三位（不足左补0），按一位整数两位小数还原。
+      例："+058" -> +0.58；"-203" -> -2.03；"4057"(把'+'误成'4') -> +0.57。
+    """
+    import re
+    if not text:
+        return None
+    s = text.strip()
+    # 规范化常见字符
+    s_norm = (s.replace("\u2212", "-")   # −
+                .replace("\u2013", "-")  # –
+                .replace("\u2014", "-")  # —
+                .replace("O", "0").replace("o", "0"))
+    # 符号判定：出现任何 '-' 即视为负；否则为正（默认+）
+    sign = -1.0 if "-" in s_norm else 1.0
+    # 提取所有数字
+    digits = "".join(ch for ch in s_norm if ch.isdigit())
+    if not digits:
+        return None
+    # 仅保留末三位（不足左补0）
+    if len(digits) < 3:
+        digits = digits.rjust(3, "0")
+    else:
+        digits = digits[-3:]
+    try:
+        return sign * (int(digits) / 100.0)
+    except ValueError:
+        return None
+
+
+def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],
+                    debug_dir: Optional[str] = None, tag: str = "") -> Tuple[Optional[float], str]:
+    """
+    对单个棋格的“原图整格”做 OCR（仅识别 +- 与数字），返回 (value or None, raw_text)。
+    小数点不参与识别；按两位小数固定格式还原：value = sign * int(digits) / 100.
+    """
+    import numpy as np
+    import cv2
+    import pytesseract
+    import re
+
+    img_rgb = np.array(img_pil.convert("RGB"))
+    H, W = img_rgb.shape[:2]
+    x0, y0, x1, y1 = cell_rect
+
+    # 左侧适当加 padding，尽量保住 +/- 号
+    pad_left, pad_top, pad_right, pad_bottom = 6, 4, 4, 4
+    x0p = max(0, x0 - pad_left); y0p = max(0, y0 - pad_top)
+    x1p = min(W, x1 + pad_right); y1p = min(H, y1 + pad_bottom)
+
+    roi = img_rgb[y0p:y1p, x0p:x1p]
+    if roi.size == 0:
+        return None, ""
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+
+    # 预处理流水线（尽量保护细符号：先放大再二值；膨胀很轻）
+    preps = []
+    up1 = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    up2 = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+
+    for g in [gray, up1, up2]:
+        # OTSU 正/反
+        bin_ = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        binI = 255 - bin_
+        preps.append(bin_)
+        preps.append(binI)
+        # 自适应正/反
+        adp = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 21, 5)
+        adpI = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, 21, 5)
+        preps.append(adp)
+        preps.append(adpI)
+
+    # 轻微膨胀模板
+    k = np.ones((2, 2), np.uint8)
+
+    cfgs = [
+        "--psm 7 -c tessedit_char_whitelist=+-0123456789",
+        "--psm 6 -c tessedit_char_whitelist=+-0123456789",
+        "--psm 8 -c tessedit_char_whitelist=+-0123456789",
+    ]
+
+    best_raw = ""
+    last_img = None
+    for img in preps:
+        img2 = cv2.dilate(img, k, iterations=1)  # 仅1次，避免吃掉负号
+        for cfg in cfgs:
+            s = pytesseract.image_to_string(img2, config=cfg).strip()
+            val = _parse_signed_digits_to_value(s)
+            last_img = img2
+            if val is not None:
+                # 调试保存
+                if debug_dir:
+                    try:
+                        os.makedirs(debug_dir, exist_ok=True)
+                        cv2.imwrite(os.path.join(debug_dir, f"cell_{tag}_ok.png"), img2)
+                        with open(os.path.join(debug_dir, f"cell_{tag}_raw.txt"), "w", encoding="utf-8") as f:
+                            f.write(s)
+                    except Exception:
+                        pass
+                return float(val), s
+            # 记录最后一次原始文本
+            if s:
+                best_raw = s
+
+    # 失败时保存最后一次图与原文
+    if debug_dir and last_img is not None:
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(debug_dir, f"cell_{tag}_last.png"), last_img)
+            with open(os.path.join(debug_dir, f"cell_{tag}_raw.txt"), "w", encoding="utf-8") as f:
+                f.write(best_raw)
+        except Exception:
+            pass
+
+    return None, best_raw
+
+def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None) -> Tuple[List[str], float]:
+    """
+    先用掩码定位“黄色最多的格”（最多取前3个），再对这些格的原图做 OCR。
+    若 OCR 全部失败，则以“面积最大”的格为 best_move，net_win=0.0（fallback）。
+    """
+    import numpy as np
+    import cv2
+    from PIL import Image
+
+    # 1) 定位：按每格黄像素面积排序
+    candidates, mask = _detect_best_cells_by_mask(img_pil, top_k=3, debug_dir=debug_dir)
+    if not candidates:
+        raise RuntimeError("no yellow found on board (mask empty)")
+
+    # 2) 依次对前 K 个格做 OCR，选读到的最大值；并列≤0.1按字典序
+    results = []  # [(coord, val, rect)]
+    for idx, (coord, area, rect) in enumerate(candidates):
+        subdir = os.path.join(debug_dir, f"roi_{idx:02d}") if debug_dir else None
+        val, raw = _ocr_cell_value(img_pil, rect, debug_dir=subdir, tag=f"{coord}")
+        if val is not None:
+            results.append((coord, float(val), rect))
+
+    if results:
+        # 合并同格（理论上 candidates 已唯一）
+        results.sort(key=lambda t: t[1], reverse=True)
+        best_val = results[0][1]
+        tied = [r for r in results if abs(r[1] - best_val) <= 0.1 + 1e-9]
+        tied.sort(key=lambda t: t[0])  # 字典序
+        best_move = tied[0][0]
+        net_win = float(best_val)
+    else:
+        # 3) 兜底：OCR 全失败 → 选择黄色面积最大的格，net_win=0.0
+        best_move = candidates[0][0]
+        net_win = 0.0
+        if debug_dir:
+            with open(os.path.join(debug_dir, "fallback.txt"), "w", encoding="utf-8") as f:
+                f.write("fallback:no-ocr; choose max-area cell\n")
+
+    # 4) 调试可视化
+    if debug_dir:
+        import numpy as np
+        img_rgb = np.array(img_pil.convert("RGB"))
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         base = os.path.join(debug_dir, "sensei")
-        Image.fromarray(img_rgb).save(base + "_board.png")
         cv2.imwrite(base + "_mask.png", mask)
         vis = img_bgr.copy()
-        for coord, (val, box, ctr) in merged.items():
-            x0, y0, x1, y1 = box
+        for coord, area, (x0, y0, x1, y1) in candidates:
             cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 255, 255), 1)
-            cv2.putText(
-                vis, f"{coord}:{val:.2f}", (x0, max(10, y0 - 3)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA
-            )
+            cv2.putText(vis, f"{coord}:{area}", (x0, max(10, y0 - 3)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.imwrite(base + "_vis.png", vis)
 
     return [best_move], net_win

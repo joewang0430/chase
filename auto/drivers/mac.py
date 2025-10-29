@@ -438,37 +438,51 @@ def _detect_best_cells_by_mask(
 
     return candidates, mask
 
-def _parse_signed_digits_to_value(text: str) -> Optional[float]:
+def _parse_signed_digits_to_value(text: str) -> float:
     """
-    仅从文本中提取“[+/-] 与数字”，忽略小数点。
-    - 符号规则：出现任何减号(−/–/—/-)即认为是负，否则一律为正（即使'+'被识别错）。
-    - 数字规则：拼接所有数字后仅取末三位（不足左补0），按一位整数两位小数还原。
-      例："+058" -> +0.58；"-203" -> -2.03；"4057"(把'+'误成'4') -> +0.57。
+    严格解析 OCR 文本为浮点数（小数点后固定两位），并在格式不合规时直接抛出 RuntimeError。
+    规则：
+      - 去掉空格后，字符串必须严格匹配：^[+-][0-9]{3,4}$ （即一个 ASCII 符号后跟 3 或 4 个数字）
+      - 支持把常见的长/短横、Unicode 加号规范为 ASCII '+'/'-' 后再检测
+      - 若不匹配则直接抛出 RuntimeError（程序会终止）
+    示例：
+      "+2811" -> 28.11
+      "+092"  -> 0.92
+      "-1024" -> -10.24
+      "+000"  -> 0.00
+      "-789"  -> -7.89
     """
     import re
-    if not text:
-        return None
+
+    if text is None:
+        raise RuntimeError("OCR returned empty text (None)")
+
     s = text.strip()
-    # 规范化常见字符
-    s_norm = (s.replace("\u2212", "-")   # −
-                .replace("\u2013", "-")  # –
-                .replace("\u2014", "-")  # —
-                .replace("O", "0").replace("o", "0"))
-    # 符号判定：出现任何 '-' 即视为负；否则为正（默认+）
-    sign = -1.0 if "-" in s_norm else 1.0
-    # 提取所有数字
-    digits = "".join(ch for ch in s_norm if ch.isdigit())
-    if not digits:
-        return None
-    # 仅保留末三位（不足左补0）
-    if len(digits) < 3:
-        digits = digits.rjust(3, "0")
-    else:
-        digits = digits[-3:]
+
+    # 规范化各种加号/减号到 ASCII
+    s = s.replace("\u2212", "-").replace("\u2013", "-").replace("\u2014", "-")  # − – —
+    s = s.replace("＋", "+").replace("﹢", "+").replace("＋", "+")
+    # 明确要求 ASCII +/-：不要中文符号等
+    # 去掉所有空格
+    s_nospace = "".join(ch for ch in s if not ch.isspace())
+
+    # 必须严格为 一个符号 + 3 或 4 个数字
+    if not re.fullmatch(r'[+\-][0-9]{3,4}', s_nospace):
+        raise RuntimeError(
+            f"Invalid OCR numeric format: {text!r} -> normalized {s_nospace!r}. "
+            "Expected ASCII '+' or '-' followed by 3 or 4 digits (e.g. +058, -1024)."
+        )
+
+    sign_char = s_nospace[0]
+    sign = -1.0 if sign_char == "-" else 1.0
+    digits = s_nospace[1:]  # 3 or 4 digits guaranteed by regex
+
+    # 按两位小数还原
     try:
         return sign * (int(digits) / 100.0)
-    except ValueError:
-        return None
+    except Exception as e:
+        # 不太可能到这里，但以防万一返回更明确错误
+        raise RuntimeError(f"Failed to parse digits '{digits}' from OCR text {text!r}: {e}")
 
 
 def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],

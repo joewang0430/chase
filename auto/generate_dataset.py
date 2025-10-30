@@ -301,6 +301,26 @@ def build_record_skeleton(
     return rec
 
 
+def _mock_bitboards(total_pcs: int, player: int) -> Tuple[int, int]:
+    """合成一对“互不重叠”的 bitboard，以便演示：
+    - 低位给对手，高位给当前方；
+    - 总子数为 total_pcs；大致对半分配（向下取整给当前方）。
+
+    注：这只是演示数据，不代表真实棋型，也不与 legal_bb 对齐。
+    """
+    total = max(0, min(63, int(total_pcs)))
+    m = max(0, total // 2)
+    o = total - m
+    my_mask = ((1 << m) - 1) << (64 - m) if m > 0 else 0
+    opp_mask = ((1 << o) - 1) if o > 0 else 0
+    if player not in (0, 1):
+        player = 0
+    if player == 0:
+        return my_mask, opp_mask
+    else:
+        return opp_mask, my_mask
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     """解析命令行参数：控制切片大小、是否压缩、flush 频率，以及少量采集参数。"""
     ap = argparse.ArgumentParser(description="Generate raw dataset (run bootstrap + writer)")
@@ -310,6 +330,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     # 先把关键运行参数也接进来，并写到 meta.json 里（不驱动对局，仅记录）
     ap.add_argument("--engine-time", type=float, default=4.0, help="seconds budget for Sensei solving")
     ap.add_argument("--early-random", type=int, default=6, help="number of early random moves")
+    ap.add_argument("--demo-lines", type=int, default=2, help="write N mock records for a dry-run demo")
     # 提前占个位：后续会新增 --driver/--time-budget/--games 等参数
     return ap.parse_args(argv)
 
@@ -334,8 +355,27 @@ def main(argv: Optional[list[str]] = None) -> None:
     params = DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random))
     update_meta_params(rp.meta_path, params)
 
-    # 人话：这里仍然不写数据。下一步把 driver 接进来，
-    #      在对局循环里构造 record 并调用 writer.append_position(record)。
+    # 4) 演示：写入极简“假数据”N 行，便于验证写入结构（不接 driver，不做合法性）
+    demo_n = int(getattr(args, "demo_lines", 0) or 0)
+    if demo_n > 0:
+        # 选择若干“目标子数”制造分段覆盖（只是演示）
+        pcs_targets = [14, 28, 40, 52]
+        game_id = f"demo_{_shortid(6)}"
+        for i in range(min(demo_n, len(pcs_targets))):
+            pcs_target = pcs_targets[i]
+            player = i % 2  # 交替当前方
+            my_bb, opp_bb = _mock_bitboards(pcs_target, player)
+            rec = build_record_skeleton(
+                game_id=game_id,
+                player=player,
+                my_bb=my_bb,
+                opp_bb=opp_bb,
+                best_moves=["d3", "c5"],  # 演示字段
+                net_win=0.0,                # 演示字段
+                engine_time=float(args.engine_time),
+                probe_ms=None,
+            )
+            writer.append_position(rec)
 
     writer.close()
     print("[DONE] run scaffold created. Writer opened and closed successfully.")

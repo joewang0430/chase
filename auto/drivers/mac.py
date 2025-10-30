@@ -1,6 +1,9 @@
 # FILEPATH (visible): /Users/juanjuan1/Desktop/chase/auto/drivers/mac.py
 # filepath: /Users/juanjuan1/Desktop/chase/auto/drivers/mac.py
 
+# caffeinate -dimsu -- python3 auto/complete_bts.py --driver mac --limit 1000
+# caffeinate -dimsu -- python3 auto/complete_bts.py --driver mac --time-budget 7200
+
 from typing import List, Tuple, Optional
 import subprocess
 import time
@@ -53,6 +56,44 @@ JSON 字段：
         bw,bh 为棋盘区域的宽高
     运行时：实际点击坐标 = 窗口坐标 + board_rel 里的相对坐标
 '''
+
+def _maximize_window_to_screen_fast(name: str, retries: int = 0, interval: float = 0.0, inset_bottom: int = 0) -> None:
+    """
+    Fast 版：一次 AppleScript，优先使用 front window（更稳），退回 window 1。
+    - 把窗口放到 {0,22}，尺寸设成 {9999, 9999-inset_bottom}，系统会裁到可视区域（非全屏）。
+    - 不做重试/校验，只在失败时打印 WARN。
+    预期耗时：~150–250ms。
+    """
+    osa = f'''
+    tell application "System Events"
+      if not (exists process "{name}") then return "NA"
+      tell process "{name}"
+        -- 选 front window，更稳；若失败退回 window 1
+        set w to missing value
+        try
+          set w to front window
+        on error
+          try
+            set w to window 1
+          on error errMsg
+            return "ERR:getWindow:" & errMsg
+          end try
+        end try
+        try
+          set position of w to {{0, 22}}
+          set size of w to {{9999, {max(1, 9999 - int(inset_bottom))}}}
+          set p to position of w
+          set s to size of w
+          return (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
+        on error errMsg2
+          return "ERR:set:" & errMsg2
+        end try
+      end tell
+    end tell
+    '''
+    out = _run_osa(osa)
+    if out == "NA" or (isinstance(out, str) and out.startswith("ERR:")):
+        print(f"[WARN] _maximize_window_to_screen_fast: {out}")
 
 def _maximize_window_to_screen(name: str, retries: int = 6, interval: float = 0.4, inset_bottom: int = 0) -> None:
     """
@@ -664,27 +705,32 @@ def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None)
     
 # ---------------------------------------- Mac Driver
 
-# ...existing code...
 class MacDriver(SoftwareDriverBase):
     def ensure_running(self) -> None:
         """
         启动/激活应用并把窗口调整为“占满桌面可视区域”（非 Full Screen）。
-        流程：
-          1) 若未运行则 open -a 启动
-          2) activate 到前台
-          3) 等待窗口出现（最多 10s）
-          4) 调用 _maximize_window_to_screen（重试内部控制）
-          5) 等待窗口尺寸稳定（连续多次相同或接近）
-        抛出：若在等待窗口出现阶段超时会抛 RuntimeError（提示 Accessibility 权限等）。
+        计时阶段：
+          1) launch（如未运行）
+          2) activate
+          3) wait_window（等待窗口出现）
+          4) size（缓冲 + 调整尺寸到可视区域）
+          5) stabilize（窗口尺寸稳定检测）
         """
-        # 1) 启动（如未运行）
+        t_total = time.perf_counter()
+
+        # 1) launch
+        t0 = time.perf_counter()
         if not _app_is_running(APP_NAME):
             _launch_app(APP_NAME)
+        print(f"[T] ensure: launch {(time.perf_counter()-t0)*1000:.0f} ms")
 
-        # 2) 激活（置前）
+        # 2) activate
+        t0 = time.perf_counter()
         _activate_app(APP_NAME)
+        print(f"[T] ensure: activate {(time.perf_counter()-t0)*1000:.0f} ms")
 
-        # 3) 等待窗口出现（最多 10s）
+        # 3) wait_window (<=10s)
+        t0 = time.perf_counter()
         deadline = time.time() + 10.0
         last_err: Optional[str] = None
         while time.time() < deadline:
@@ -695,47 +741,25 @@ class MacDriver(SoftwareDriverBase):
                 last_err = str(e)
             time.sleep(0.18)
         else:
-            hint = (
-                "If this is the first run or permissions changed, grant Accessibility: "
-                "System Settings > Privacy & Security > Accessibility, add your Terminal/IDE."
-            )
+            print(f"[T] ensure: wait_window {(time.perf_counter()-t0)*1000:.0f} ms")
+            hint = "Grant Accessibility to Terminal/IDE in System Settings > Privacy & Security > Accessibility."
             if last_err:
                 raise RuntimeError(f"Failed to detect window for '{APP_NAME}': {last_err}. {hint}")
             raise RuntimeError(f"Timed out waiting for '{APP_NAME}' window. {hint}")
+        print(f"[T] ensure: wait_window {(time.perf_counter()-t0)*1000:.0f} ms")
 
-        # 4) 稍等布局稳定再调整大小
-        # time.sleep(0.35)
+        # 4) size (short buffer + resize)
+        t0 = time.perf_counter()
         time.sleep(0.15)
-        _maximize_window_to_screen(APP_NAME, retries=6, interval=0.35, inset_bottom=0)
+        _maximize_window_to_screen_fast(APP_NAME, retries=0, interval=0.0, inset_bottom=0)
+        print(f"[T] ensure: size {(time.perf_counter()-t0)*1000:.0f} ms")
 
-        # 5) 等待尺寸稳定：连续检测 N 次相同/接近的 bounds
-        stable_deadline = time.time() + 4.0
-        last_bounds = None
-        same_count = 0
-        tol = 200
-        while time.time() < stable_deadline:
-            try:
-                b = _get_window_bounds(APP_NAME)
-            except Exception:
-                b = None
-            if b is None:
-                same_count = 0
-            else:
-                if last_bounds is None:
-                    last_bounds = b
-                    same_count = 1
-                else:
-                    if all(abs(b[i] - last_bounds[i]) <= tol for i in range(4)):
-                        same_count += 1
-                    else:
-                        last_bounds = b
-                        same_count = 1
-            if same_count >= 3:
-                return
-            time.sleep(0.18)
+        # 5) stabilize
+        t0 = time.perf_counter()
+        time.sleep(0.15)  # 固定等待 150ms
+        print(f"[T] ensure: stabilize {(time.perf_counter()-t0)*1000:.0f} ms")
 
-        # 未完全稳定但已尽力：打印警告，不抛以免阻断后续 probe 操作
-        print(f"[WARN] ensure_running: window for '{APP_NAME}' not confirmed stable after attempts (last_bounds={last_bounds})")
+        print(f"[T] ensure: total {(time.perf_counter()-t_total):.2f} s")
 
     # 探针：窗口截图探针，供 --probe-snap 使用
     def snap_window(self, out_path: str) -> str:

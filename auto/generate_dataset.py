@@ -25,7 +25,7 @@ import gzip
 import uuid
 import argparse
 from dataclasses import dataclass
-from typing import Optional, IO, Dict, Any
+from typing import Optional, IO, Dict, Any, Tuple
 
 
 ROOT = os.path.dirname(os.path.dirname(__file__))  # repo root
@@ -165,12 +165,151 @@ class RunWriter:
                 self._fh = None
 
 
+# ------------------------------
+# 下一步：参数与记录构造的“辅助件”（先搭骨架，不跑对局）
+
+@dataclass
+class DatasetParams:
+    """本次采集的重要参数（会写进 meta.json，便于复现与审计）。
+
+    人话：这些不是“写文件必须用”的参数，而是让将来知道这批数据是怎么跑出来的。
+    """
+    engine_time: float = 4.0          # Sensei 求解时限（秒）
+    early_random_moves: int = 6       # 开局前 N 步走“更随机”的策略
+    pcs_min: int = 12                 # 只收子数下界（含）
+    pcs_max: int = 53                 # 只收子数上界（含）；到 53 直接结束一盘
+    skip_pass: bool = True            # PASS 步不收
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转为能写进 meta.json 的 dict。"""
+        return {
+            "engine_time": float(self.engine_time),
+            "early_random_moves": int(self.early_random_moves),
+            "pcs_min": int(self.pcs_min),
+            "pcs_max": int(self.pcs_max),
+            "skip_pass": bool(self.skip_pass),
+        }
+
+
+def update_meta_params(meta_path: str, params: DatasetParams) -> None:
+    """把参数合并写入 meta.json（保留已有字段）。
+
+    人话：不覆盖历史信息，只是把 params 转成 dict 后合并进去。
+    """
+    try:
+        cur = {}
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                cur = json.load(f)
+        cur.setdefault("params", {})
+        cur["params"].update(params.to_dict())
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        # 这里不抛，避免写参数影响主流程；打印提示即可
+        print(f"[WARN] update_meta_params failed: {e}")
+
+
+def stage_from_pcs(pcs: int) -> int:
+    """按约定把子数映射到阶段：1:[12,25], 2:[26,39], 3:[40,53]。
+
+    人话：这只是一个“分桶函数”，方便训练分段用。
+    """
+    if pcs <= 25:
+        return 1
+    if pcs <= 39:
+        return 2
+    return 3
+
+
+def should_capture(pcs: int, is_pass: bool, cfg: DatasetParams) -> bool:
+    """决定这一手要不要入库：
+    - 跳过 PASS（可配置）；
+    - 只收 pcs ∈ [cfg.pcs_min, cfg.pcs_max]。
+    """
+    if cfg.skip_pass and is_pass:
+        return False
+    return (cfg.pcs_min <= pcs <= cfg.pcs_max)
+
+
+def bit_count(x: int) -> int:
+    """Python 的 int 有大位宽，这里用内置 bit_count；老版本可换成 bin(x).count('1')。"""
+    try:
+        return int(x).bit_count()  # type: ignore[attr-defined]
+    except AttributeError:
+        return bin(int(x)).count("1")
+
+
+def compute_pcs(my_bb: int, opp_bb: int) -> int:
+    """计算当前子数（黑白总和），用于过滤与分段。"""
+    return bit_count(my_bb) + bit_count(opp_bb)
+
+
+def make_key(my_bb: int, opp_bb: int, player: int) -> str:
+    """构造简单的去重 key：<my>:<opp>:<player>（十六进制）。"""
+    return f"{my_bb:016x}:{opp_bb:016x}:{player}"
+
+
+def build_record_skeleton(
+    *,
+    game_id: str,
+    player: int,
+    my_bb: int,
+    opp_bb: int,
+    legal_bb: Optional[int] = None,
+    legal_count: Optional[int] = None,
+    best_moves: Optional[list[str]] = None,
+    net_win: Optional[float] = None,
+    engine_time: Optional[float] = None,
+    probe_ms: Optional[float] = None,
+) -> Dict[str, Any]:
+    """按约定字段产出一条“待写入”的记录骨架。
+
+    人话：
+    - 这里不强制所有字段都有值（有些留给后续阶段补全）。
+    - pcs/stage/key 在这里直接算好；其它从调用者传入。
+    - legal_bb/最佳着法/数值等，调用前应在上层算好并传进来。
+    """
+    pcs = compute_pcs(my_bb, opp_bb)
+    rec: Dict[str, Any] = {
+        "key": make_key(my_bb, opp_bb, player),
+        "game_id": str(game_id),
+        "player": int(player),
+        "my_bb": int(my_bb),
+        "opp_bb": int(opp_bb),
+        "pcs": int(pcs),
+        "stage": stage_from_pcs(pcs),
+        "timestamp": int(time.time()),
+    }
+    if legal_bb is not None:
+        rec["legal_bb"] = int(legal_bb)
+    if legal_count is not None:
+        rec["legal_count"] = int(legal_count)
+    if best_moves is not None:
+        rec["best_moves"] = [str(m) for m in best_moves]
+    if net_win is not None:
+        # 夹到 [-64,64]
+        try:
+            v = float(net_win)
+            rec["net_win"] = max(-64.0, min(64.0, v))
+        except Exception:
+            pass
+    if engine_time is not None:
+        rec["engine_time"] = float(engine_time)
+    if probe_ms is not None:
+        rec["probe_ms"] = float(probe_ms)
+    return rec
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    """解析命令行参数：控制切片大小、是否压缩、flush 频率。"""
+    """解析命令行参数：控制切片大小、是否压缩、flush 频率，以及少量采集参数。"""
     ap = argparse.ArgumentParser(description="Generate raw dataset (run bootstrap + writer)")
     ap.add_argument("--chunk-lines", type=int, default=200_000, help="lines per chunk before rolling")
     ap.add_argument("--no-compress", action="store_true", help="disable gzip compression for chunks")
     ap.add_argument("--flush-every", type=int, default=1000, help="flush after N lines")
+    # 先把关键运行参数也接进来，并写到 meta.json 里（不驱动对局，仅记录）
+    ap.add_argument("--engine-time", type=float, default=4.0, help="seconds budget for Sensei solving")
+    ap.add_argument("--early-random", type=int, default=6, help="number of early random moves")
     # 提前占个位：后续会新增 --driver/--time-budget/--games 等参数
     return ap.parse_args(argv)
 
@@ -191,7 +330,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         flush_every=int(args.flush_every),
     )
 
-    # 这里先不写数据。下一步把 driver 接进来，
+    # 3) 把本次“关键运行参数”落在 meta.json，便于追溯
+    params = DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random))
+    update_meta_params(rp.meta_path, params)
+
+    # 人话：这里仍然不写数据。下一步把 driver 接进来，
     #      在对局循环里构造 record 并调用 writer.append_position(record)。
 
     writer.close()

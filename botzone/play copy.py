@@ -9,16 +9,16 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # 添加 Python 3.6 兼容 popcount (替换 int.bit_count)
 POPCNT8 = [bin(i).count('1') for i in range(256)]
 ENDING_SO_NAME = "ending.so"
-# 需要加载的 3 个（新结构）模型文件名（位于本目录 data/ 下）
-NN_NAME_EARLY_128 = "chase_early_128.pt"
-NN_NAME_MID_128   = "chase_mid_128.pt"
-NN_NAME_LATE_96   = "chase_late_96.pt"
-NN_ALL = [NN_NAME_EARLY_128, NN_NAME_MID_128, NN_NAME_LATE_96]
+# 需要同时加载的 4 个（旧 Torch 兼容格式）模型文件名
+NN_NAME_1 = "chase1_compat.pt"
+NN_NAME_2 = "chase2_compat.pt"
+NN_NAME_3 = "chase3_compat.pt"
+NN_NAME_4 = "chase4_compat.pt"
+NN_ALL = [NN_NAME_1, NN_NAME_2, NN_NAME_3, NN_NAME_4]
 
 START_TIME = 0
 
@@ -160,53 +160,59 @@ def apply_move(me: int, opp: int, pos: int):
 
 # @@ NN part begins
 class ResidualBlock(nn.Module):
-    def __init__(self, ch):
-        super(ResidualBlock, self).__init__()
+    def __init__(self, ch: int):
+        super().__init__()
         self.c1 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
         self.b1 = nn.BatchNorm2d(ch)
         self.c2 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
         self.b2 = nn.BatchNorm2d(ch)
+        self.act = nn.ReLU(inplace=True)
     def forward(self, x):
-        y = self.c1(x)
-        y = self.b1(y)
-        y = F.relu(y, inplace=True)
-        y = self.c2(y)
-        y = self.b2(y)
-        return F.relu(x + y, inplace=True)
-
-
-class NetBase(nn.Module):
-    """Base net: 8 residual blocks, parameterized channels; heads produce 64 logits and 1 value.
-    Matches the state_dict layout saved by nn/model_def_128.py and nn/model_def_96.py.
-    """
-    def __init__(self, channels):
-        super(NetBase, self).__init__()
+        h = self.c1(x)
+        h = self.b1(h)
+        h = self.act(h)
+        h = self.c2(h)
+        h = self.b2(h)
+        return self.act(x + h)
+    
+class Net(nn.Module):
+    """7 residual blocks, 64 channels (与 nn/model_def.Net 当前版本保持一致)."""
+    def __init__(self, channels: int = 64, n_blocks: int = 7, input_planes: int = 4):
+        super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(4, channels, 3, padding=1, bias=False),
+            nn.Conv2d(input_planes, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
         )
-        self.blocks = nn.ModuleList([ResidualBlock(channels) for _ in range(8)])
-        # Policy head
-        self.p_c = nn.Conv2d(channels, 8, 1, bias=False)
-        self.p_bn = nn.BatchNorm2d(8)
-        self.p_fc1 = nn.Linear(8 * 8 * 8, 256)
-        self.p_fc2 = nn.Linear(256, 64)
-        # Value head
-        self.v_c = nn.Conv2d(channels, 4, 1, bias=False)
-        self.v_bn = nn.BatchNorm2d(4)
-        self.v_fc1 = nn.Linear(4 * 8 * 8, 256)
-        self.v_fc2 = nn.Linear(256, 128)
-        self.v_fc3 = nn.Linear(128, 1)
+        self.body = nn.Sequential(*[ResidualBlock(channels) for _ in range(n_blocks)])
+        # policy head
+        self.p_head = nn.Sequential(
+            nn.Conv2d(channels, 8, 1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+        )
+        self.p_fc1 = nn.Linear(8 * 8 * 8, 128)
+        self.p_fc2 = nn.Linear(128, 65)  # 64 + pass
+        # value head
+        self.v_head = nn.Sequential(
+            nn.Conv2d(channels, 4, 1, bias=False),
+            nn.BatchNorm2d(4),
+            nn.ReLU(inplace=True),
+        )
+        self.v_fc1 = nn.Linear(4 * 8 * 8, 128)
+        self.v_fc2 = nn.Linear(128, 64)
+        self.v_fc3 = nn.Linear(64, 1)
+        self.act = nn.ReLU(inplace=True)
         self.tanh = nn.Tanh()
-        # Kaiming init similar to training code
+        self._init_weights()
+
+    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                fan = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2.0 / fan))
             elif isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                nn.init.kaiming_normal_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.BatchNorm2d):
@@ -215,30 +221,19 @@ class NetBase(nn.Module):
 
     def forward(self, x):
         x = self.stem(x)
-        for blk in self.blocks:
-            x = blk(x)
-        # Policy
-        p = F.relu(self.p_bn(self.p_c(x)), inplace=True)
+        x = self.body(x)
+        # policy
+        p = self.p_head(x)
         p = p.view(p.size(0), -1)
-        p = F.relu(self.p_fc1(p), inplace=True)
-        policy_logits = self.p_fc2(p)
-        # Value
-        v = F.relu(self.v_bn(self.v_c(x)), inplace=True)
+        p = self.act(self.p_fc1(p))
+        p = self.p_fc2(p)  # raw logits
+        # value
+        v = self.v_head(x)
         v = v.view(v.size(0), -1)
-        v = F.relu(self.v_fc1(v), inplace=True)
-        v = F.relu(self.v_fc2(v), inplace=True)
-        value = self.tanh(self.v_fc3(v))
-        return policy_logits, value
-
-
-class Net128(NetBase):
-    def __init__(self):
-        super(Net128, self).__init__(channels=128)
-
-
-class Net96(NetBase):
-    def __init__(self):
-        super(Net96, self).__init__(channels=96)
+        v = self.act(self.v_fc1(v))
+        v = self.act(self.v_fc2(v))
+        v = self.tanh(self.v_fc3(v))
+        return p, v
 # @@ NN part ends
 
 
@@ -260,11 +255,11 @@ class OthelloAI:
         self.endgame_error = None  # 记录 ctypes 加载 / 调用失败原因
 
     # @@ NN part begins
-        # 三个模型（前两段 128 通道，末段 96 通道）
-        self.nn_models = [None, None, None]  # type: ignore
+        # 四个模型（7res x 64ch）
+        self.nn_models = [None, None, None, None]  # type: ignore
         self.nn_loaded = False
-        self.nn_total_load_ms = None  # 三个模型整体加载耗时
-        self.nn_errors = [None, None, None]
+        self.nn_total_load_ms = None  # 四个模型整体加载耗时
+        self.nn_errors = [None, None, None, None]
 
     def load_nn(self):
         if self.nn_loaded:
@@ -282,13 +277,38 @@ class OthelloAI:
                 if path is None:
                     self.nn_errors[idx] = 'not_found'
                     continue
-                state = torch.load(path, map_location='cpu')
-                # 选择对应结构
-                if idx == 0 or idx == 1:
-                    net = Net128()
+                ckpt = torch.load(path, map_location='cpu')
+                if isinstance(ckpt, dict) and 'model_state' in ckpt:
+                    arch = ckpt.get('arch', {})
+                    ch = arch.get('channels', 64)
+                    blocks = arch.get('n_blocks', 7)
+                    inp = arch.get('input_planes', 4)
+                    net = Net(channels=ch, n_blocks=blocks, input_planes=inp)
+                    state = ckpt['model_state']
+                elif isinstance(ckpt, dict):
+                    net = Net()  # 64x7 默认
+                    state = ckpt
                 else:
-                    net = Net96()
-                net.load_state_dict(state, strict=True)
+                    self.nn_errors[idx] = 'bad_format'
+                    continue
+                # 旧命名兼容（若训练脚本还在用 blocks./p_c 等）
+                if any(k.startswith(prefix) for prefix in ("blocks.", "p_c", "p_bn", "v_c", "v_bn") for k in state.keys()):
+                    remapped = {}
+                    for k, v in state.items():
+                        nk = k
+                        if nk.startswith('blocks.'):
+                            nk = 'body.' + nk[len('blocks.') :]
+                        elif nk.startswith('p_c.'):
+                            nk = 'p_head.0.' + nk[len('p_c.') :]
+                        elif nk.startswith('p_bn.'):
+                            nk = 'p_head.1.' + nk[len('p_bn.') :]
+                        elif nk.startswith('v_c.'):
+                            nk = 'v_head.0.' + nk[len('v_c.') :]
+                        elif nk.startswith('v_bn.'):
+                            nk = 'v_head.1.' + nk[len('v_bn.') :]
+                        remapped[nk] = v
+                    state = remapped
+                net.load_state_dict(state, strict=False)
                 net.eval()
                 self.nn_models[idx] = net
                 self.nn_errors[idx] = None
@@ -481,28 +501,22 @@ class OthelloAI:
         if self.nn_loaded:
             ok = sum(1 for m in self.nn_models if m is not None)
             if self.nn_total_load_ms is not None:
-                dbg_parts.append(f"nn={ok}/3@{self.nn_total_load_ms:.1f}ms")
+                dbg_parts.append(f"nn={ok}/4@{self.nn_total_load_ms:.1f}ms")
             else:
-                dbg_parts.append(f"nn={ok}/3")
+                dbg_parts.append(f"nn={ok}/4")
             # 若有失败，附加简短错误索引
-            if ok < 3:
+            if ok < 4:
                 fail_indices = [str(i+1) for i,e in enumerate(self.nn_errors) if e]
                 if fail_indices:
                     dbg_parts.append("fail=" + ','.join(fail_indices))
         else:
             dbg_parts.append("nn=?")
-        # NN 基准（3 个模型分别 100 次）
+        # NN 基准
         if hasattr(self, "nn_bench_total_ms"):
             if self.nn_bench_total_ms is not None:
-                # 输出每个模型单独耗时与平均（每次）耗时
-                if hasattr(self, "nn_bench_each_ms") and isinstance(self.nn_bench_each_ms, list):
-                    labels = getattr(self, "nn_bench_labels", ["m1","m2","m3"])
-                    runs = getattr(self, "nn_bench_runs", 100)
-                    parts = []
-                    for i, ms in enumerate(self.nn_bench_each_ms):
-                        avg = (ms / runs) if runs else 0.0
-                        parts.append(f"{labels[i]}:{runs}@{ms:.1f}ms/{avg:.3f}ms")
-                    dbg_parts.append("bench3=" + ','.join(parts))
+                dbg_parts.append(
+                    f"bench={self.nn_bench_n}@{self.nn_bench_total_ms:.1f}ms/{self.nn_bench_avg_ms:.3f}ms"
+                )
             elif hasattr(self, "nn_bench_err"):
                 dbg_parts.append(f"bench_err={self.nn_bench_err}")
         return ';'.join(dbg_parts)
@@ -523,7 +537,8 @@ class OthelloAI:
         # ----------------------------- @@ NN part begins
         self.load_nn()
 
-        # 基准：若模型成功加载，对当前局面构造一次输入，做 3 个模型各 100 次前向测时（共 300 次）
+        # 基准：若模型成功加载，对当前局面构造一次输入，做 1000 次前向测时
+        # 四模型基准：每个 250 次，总共 1000 次（成功加载的数量 * 250）
         if any(m is not None for m in self.nn_models) and not getattr(self, 'nn_bench_done', False):
             # 构造输入平面 (1,4,8,8): 0=my,1=opp,2=empty,3=legal
             planes = torch.zeros((1, 4, 8, 8), dtype=torch.float32)
@@ -564,40 +579,29 @@ class OthelloAI:
                 r, c = divmod(idx, 8)
                 planes[0, 3, r, c] = 1.0
                 tmp ^= lsb
-            per_model_runs = 100
+            per_model_runs = 250
             try:
                 with torch.no_grad():
                     total_calls = 0
                     total_time = 0.0
-                    each_ms = []
-                    labels = ["early128", "mid128", "late96"]
                     for net in self.nn_models:
                         if net is None:
-                            each_ms.append(0.0)
                             continue
                         _ = net(planes)  # warmup
                         t0 = time.perf_counter()
-                        i = 0
-                        while i < per_model_runs:
+                        for _ in range(per_model_runs):
                             _ = net(planes)
-                            i += 1
                         t1 = time.perf_counter()
-                        elapsed_ms = (t1 - t0) * 1000.0
-                        each_ms.append(elapsed_ms)
                         total_time += (t1 - t0)
                         total_calls += per_model_runs
                 if total_calls > 0:
                     self.nn_bench_n = total_calls
                     self.nn_bench_total_ms = total_time * 1000.0
                     self.nn_bench_avg_ms = self.nn_bench_total_ms / total_calls
-                    self.nn_bench_each_ms = each_ms
-                    self.nn_bench_labels = labels
-                    self.nn_bench_runs = per_model_runs
                 else:
                     self.nn_bench_n = 0
                     self.nn_bench_total_ms = None
                     self.nn_bench_avg_ms = None
-                    self.nn_bench_each_ms = None
             except Exception as e:
                 self.nn_bench_total_ms = None
                 self.nn_bench_avg_ms = None

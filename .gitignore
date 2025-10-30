@@ -5,6 +5,7 @@ other_bots/
 reference/
 book/
 cv/
+dataset/
 
 # train set not send
 data/*

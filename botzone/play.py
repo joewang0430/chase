@@ -17,8 +17,8 @@ ENDING_SO_NAME = "ending.so"
 # 需要加载的 3 个（新结构）模型文件名（位于本目录 data/ 下）
 NN_NAME_EARLY_128 = "chase_early_128.pt"
 NN_NAME_MID_128   = "chase_mid_128.pt"
-NN_NAME_LATE_96   = "chase_late_96.pt"
-NN_ALL = [NN_NAME_EARLY_128, NN_NAME_MID_128, NN_NAME_LATE_96]
+NN_NAME_LATE_64   = "chase_late_64.pt"
+NN_ALL = [NN_NAME_EARLY_128, NN_NAME_MID_128, NN_NAME_LATE_64]
 
 START_TIME = 0
 
@@ -236,9 +236,9 @@ class Net128(NetBase):
         super(Net128, self).__init__(channels=128)
 
 
-class Net96(NetBase):
+class Net64(NetBase):
     def __init__(self):
-        super(Net96, self).__init__(channels=96)
+        super(Net64, self).__init__(channels=64)
 # @@ NN part ends
 
 
@@ -287,7 +287,7 @@ class OthelloAI:
                 if idx == 0 or idx == 1:
                     net = Net128()
                 else:
-                    net = Net96()
+                    net = Net64()
                 net.load_state_dict(state, strict=True)
                 net.eval()
                 self.nn_models[idx] = net
@@ -570,7 +570,7 @@ class OthelloAI:
                     total_calls = 0
                     total_time = 0.0
                     each_ms = []
-                    labels = ["early128", "mid128", "late96"]
+                    labels = ["early128", "mid128", "late64"]
                     for net in self.nn_models:
                         if net is None:
                             each_ms.append(0.0)

@@ -31,6 +31,7 @@ class Converters:
             lines.append(f"{row+1} " + " ".join(row_cells))
         return "\n".join(lines)
     
+    # WARNING: here ● (me), ○ (opp); not ● (black), ○ (opp)
     @staticmethod
     def visual_to_bb(text: str) -> tuple[int, int]:
         '''

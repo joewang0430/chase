@@ -25,7 +25,10 @@ import gzip
 import uuid
 import argparse
 from dataclasses import dataclass
-from typing import Optional, IO, Dict, Any, Tuple
+from typing import Optional, IO, Dict, Any, Tuple, List
+import random
+import ctypes
+import subprocess
 
 
 ROOT = os.path.dirname(os.path.dirname(__file__))  # repo root
@@ -66,6 +69,80 @@ def p_for_pcs(pcs: int, schedule: Optional[Dict[int, float]] = None, default: fl
         return float(m.get(int(pcs), float(default)))
     except Exception:
         return float(default)
+
+
+# ------------------------------
+# C 端随机评估器（eva_noise_random.c）绑定（仅用于开局 3-8 步）
+
+class _CSampler:
+    """轻量封装 c/eva_noise_random.c，提供 choose_move 和 generate_moves。
+
+    仅在需要时加载；找不到库则抛错（严格失败）。
+    """
+    def __init__(self) -> None:
+        self.lib: Optional[ctypes.CDLL] = None
+        self._choose_move = None
+        self._gen_moves = None
+
+    def _lib_paths(self) -> Tuple[str, str]:
+        src = os.path.join(ROOT, "c", "eva_noise_random.c")
+        if sys.platform == "darwin":
+            lib = os.path.join(ROOT, "c", "eva_noise_random.dylib")
+        else:
+            lib = os.path.join(ROOT, "c", "eva_noise_random.so")
+        return src, lib
+
+    def _maybe_build(self, src: str, out: str) -> None:
+        # 尝试在库缺失或过期时构建；若本机没有编译器则抛错
+        need = (not os.path.exists(out)) or (os.path.getmtime(out) < os.path.getmtime(src))
+        if not need:
+            return
+        cc_candidates = ["clang", "gcc"]
+        is_darwin = sys.platform == "darwin"
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        last_err = None
+        for cc in cc_candidates:
+            try:
+                if is_darwin:
+                    cmd = [cc, "-O3", "-std=c11", "-fPIC", "-dynamiclib", "-o", out, src]
+                else:
+                    cmd = [cc, "-O3", "-std=c11", "-fPIC", "-shared", "-o", out, src]
+                subprocess.run(cmd, check=True)
+                return
+            except Exception as e:
+                last_err = e
+        raise RuntimeError(f"failed to build eva_noise_random: {last_err}")
+
+    def ensure_loaded(self) -> None:
+        if self.lib is not None:
+            return
+        src, libp = self._lib_paths()
+        self._maybe_build(src, libp)
+        lib = ctypes.CDLL(libp)
+        # int choose_move(uint64_t my_pieces, uint64_t opp_pieces)
+        lib.choose_move.argtypes = (ctypes.c_uint64, ctypes.c_uint64)
+        lib.choose_move.restype = ctypes.c_int
+        # u64 generate_moves(Board board)
+        class CBoard(ctypes.Structure):
+            _fields_ = [("board", ctypes.c_uint64 * 2)]
+        self.CBoard = CBoard  # type: ignore[attr-defined]
+        lib.generate_moves.argtypes = (CBoard,)  # type: ignore[attr-defined]
+        lib.generate_moves.restype = ctypes.c_uint64
+        self.lib = lib
+        self._choose_move = lib.choose_move
+        self._gen_moves = lib.generate_moves
+
+    def choose_move(self, my_bb: int, opp_bb: int) -> int:
+        self.ensure_loaded()
+        pos = int(self._choose_move(ctypes.c_uint64(my_bb), ctypes.c_uint64(opp_bb)))  # type: ignore[misc]
+        return pos
+
+    def generate_moves(self, my_bb: int, opp_bb: int) -> int:
+        self.ensure_loaded()
+        b = self.CBoard()  # type: ignore[attr-defined]
+        b.board[0] = ctypes.c_uint64(int(my_bb))
+        b.board[1] = ctypes.c_uint64(int(opp_bb))
+        return int(self._gen_moves(b))  # type: ignore[misc]
 
 
 def _now_iso() -> str:
@@ -299,6 +376,186 @@ def adjust_p_with_net_win(
         p0 = 0.5
     p_new = (1.0 - s) * p0 + s * p_target
     return _clamp(p_new, 0.0, 1.0)
+
+
+# ------------------------------
+# 开局前 8 手：1-6（纯本地），7-8（带 OCR/oracle），不写盘，仅推进状态
+
+# 复用 botzone/play.py 的简单位棋盘函数（legal_moves/apply_move）
+try:
+    from botzone.play import legal_moves as _legal_moves, apply_move as _apply_move
+except Exception:
+    _legal_moves = None
+    _apply_move = None
+
+def _ensure_play_funcs() -> None:
+    if _legal_moves is None or _apply_move is None:
+        raise RuntimeError("botzone.play legal_moves/apply_move not available")
+
+def _mv_to_idx(mv: str) -> int:
+    from utils.converters import Converters
+    return Converters.mv_to_dmv(mv)
+
+def _idx_to_mv(idx: int) -> str:
+    from utils.converters import Converters
+    return Converters.dmv_to_mv(idx)
+
+def _black_white_to_my_opp(black: int, white: int, side: str) -> Tuple[int, int]:
+    """side: 'B' or 'W' → 返回 (my, opp)。"""
+    if side.upper() == 'B':
+        return black, white
+    else:
+        return white, black
+
+def _apply_on_bw(black: int, white: int, side: str, pos: int) -> Tuple[int, int, str]:
+    """在黑白位板上以 side 落子 pos（0..63），返回更新后的 (black, white, next_side)。
+    使用 botzone.play.apply_move（me,opp）语义。
+    """
+    _ensure_play_funcs()
+    me, opp = _black_white_to_my_opp(black, white, side)
+    # 严格校验：pos 必须在合法棋位中
+    legal = _legal_moves(me, opp)
+    if pos < 0 or pos > 63 or not (legal & (1 << pos)):
+        raise RuntimeError(f"illegal move @{pos} for side={side}")
+    out = _apply_move(me, opp, pos)
+    if not out:
+        raise RuntimeError(f"illegal move @{pos} for side={side}")
+    me2, opp2 = out
+    if side.upper() == 'B':
+        black2, white2 = me2, opp2
+        next_side = 'W'
+    else:
+        black2, white2 = opp2, me2
+        next_side = 'B'
+    return black2, white2, next_side
+
+def _has_legal(black: int, white: int, side: str) -> bool:
+    _ensure_play_funcs()
+    me, opp = _black_white_to_my_opp(black, white, side)
+    return _legal_moves(me, opp) != 0
+
+def opening_moves_1_to_6(*, rng: Optional[random.Random] = None) -> Tuple[List[str], int, int, str]:
+    """生成开局前 1-6 手，不用 OCR：
+    - 第 1 手黑：等概率随机 d3/c4/e6/f5；
+    - 第 2 手白：按首手显式表的 0.55/0.35/0.10 分布；
+    - 第 3-6 手：用 C 评估器 choose_move 抽样；
+    - 遇 PASS 不计数，直到实际落子才计数；
+    返回：(moves, black_bb, white_bb, side_to_move)。
+    """
+    _ensure_play_funcs()
+    rng = rng or random.Random()
+    # 初始标准盘（黑先）
+    black = (1 << (3*8+4)) | (1 << (4*8+3))
+    white = (1 << (3*8+3)) | (1 << (4*8+4))
+    side = 'B'
+    moves: List[str] = []
+    sampler = _CSampler()
+
+    # 第 1 手：黑等概率
+    first_candidates = ["d3", "c4", "e6", "f5"]
+    mv1 = rng.choice(first_candidates)
+    idx1 = _mv_to_idx(mv1)
+    black, white, side = _apply_on_bw(black, white, side, idx1)
+    moves.append(mv1)
+
+    # 第 2 手：白显式表
+    second_map: Dict[str, Tuple[List[str], List[float]]] = {
+        "d3": (["c5", "c3", "e3"], [0.55, 0.35, 0.10]),
+        "c4": (["e3", "c3", "c5"], [0.55, 0.35, 0.10]),
+        "e6": (["f4", "f6", "d6"], [0.55, 0.35, 0.10]),
+        "f5": (["d6", "f6", "f4"], [0.55, 0.35, 0.10]),
+    }
+    cand2, prob2 = second_map[mv1]
+    mv2 = rng.choices(cand2, weights=prob2, k=1)[0]
+    idx2 = _mv_to_idx(mv2)
+    black, white, side = _apply_on_bw(black, white, side, idx2)
+    moves.append(mv2)
+
+    # 第 3-6 手：C 抽样（处理 PASS：不计数，切换走子）
+    while len(moves) < 6:
+        if not _has_legal(black, white, side):
+            # PASS：切换一手；若连续 PASS（理论上不会发生在前 8 手），直接 break 防御
+            side = 'W' if side == 'B' else 'B'
+            if not _has_legal(black, white, side):
+                break
+            # 不计数，继续
+            continue
+        me, opp = _black_white_to_my_opp(black, white, side)
+        pos = sampler.choose_move(me, opp)
+        if pos < 0 or pos > 63:
+            raise RuntimeError(f"C sampler returned invalid move: {pos}")
+        mv = _idx_to_mv(pos)
+        black, white, side = _apply_on_bw(black, white, side, pos)
+        moves.append(mv)
+
+    return moves, black, white, side
+
+
+def opening_moves_7_to_8(
+    *,
+    moves_so_far: List[str],
+    black_bb: int,
+    white_bb: int,
+    side_to_move: str,
+    driver_name: Optional[str] = None,
+    mock: bool = False,
+    rng: Optional[random.Random] = None,
+) -> Tuple[List[str], int, int, str, List[Dict[str, Any]]]:
+    """推进第 7-8 手：每手 50% C 噪声，50% oracle（OCR 最佳点，多候选随机其一）。
+
+    入参：截至 6 手的 moves_so_far、黑白位板、轮到方；
+    返回：新增的 moves_7to8、更新位板和 side_to_move，以及每步的日志条目（来源/所选 move/net_win 等）。
+    严格模式：任何不可预期情况直接抛错（由调用者负责保存前序数据）。
+    """
+    from auto.drivers import create_driver
+    _ensure_play_funcs()
+    rng = rng or random.Random()
+    sampler = _CSampler()
+
+    logs: List[Dict[str, Any]] = []
+    new_moves: List[str] = []
+    black = int(black_bb)
+    white = int(white_bb)
+    side = side_to_move.upper()
+
+    # 准备 driver（oracle 2s）
+    drv = create_driver(engine_time=2.0, driver=driver_name, mock=mock)
+
+    while len(new_moves) < 2:  # 两手，PASS 不计数
+        # PASS 处理：不计数；若连续 PASS（虽然前 8 手不会出现），仍做防御
+        if not _has_legal(black, white, side):
+            side = 'W' if side == 'B' else 'B'
+            if not _has_legal(black, white, side):
+                raise RuntimeError("consecutive PASS within first 8 moves")
+            continue
+
+        use_oracle = rng.random() < 0.5
+        if use_oracle:
+            # 用 UI 驱动读取“黄色最佳候选们”和 net_win；并从候选中随机一个
+            # 这里复用 complete_bts 的 solve 接口语义（回放 moves_so_far）
+            best_moves, net_win = drv.solve(moves_so_far)
+            if not isinstance(best_moves, list) or len(best_moves) == 0:
+                raise RuntimeError(f"oracle returned empty best_moves: {best_moves}")
+            mv = rng.choice([str(m) for m in best_moves])
+            pos = _mv_to_idx(mv)
+            src = "oracle"
+            logs.append({"src": src, "mv": mv, "net_win": float(net_win) if net_win is not None else None})
+        else:
+            # C 噪声
+            me, opp = _black_white_to_my_opp(black, white, side)
+            pos = sampler.choose_move(me, opp)
+            if pos < 0 or pos > 63:
+                raise RuntimeError(f"C sampler returned invalid move: {pos}")
+            mv = _idx_to_mv(pos)
+            src = "noise"
+            logs.append({"src": src, "mv": mv})
+
+        # 应用到黑白位板 & 累积 moves_so_far
+        black, white, side = _apply_on_bw(black, white, side, pos)
+    new_moves.append(mv)
+    moves_so_far.append(mv)
+
+    return new_moves, black, white, side, logs
 
 
 def stage_from_pcs(pcs: int) -> int:

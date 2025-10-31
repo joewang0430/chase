@@ -73,14 +73,14 @@ from utils.converters import Converters
 
 DEMO_BOARD = """
    a b c d e f g h
- 1 ○ · · ○ ○ ○ ○ ·
- 2 ○ ○ ○ ● ○ ○ · ·
- 3 ○ ○ ○ ○ ○ ○ · ·
- 4 ○ ● ● ● ○ ● · ·
- 5 ● ● ○ ○ ● ● · ·
- 6 · ● · ○ ● ● · ·
- 7 · · ● ○ ● ● · ·
- 8 · · ○ ○ ○ · · ·
+ 1 · · · · · · · ·
+ 2 · · · · · · · ·
+ 3 · · ○ ○ ○ · · ·
+ 4 · · ● ● ○ · · ·
+ 5 · · · ● ○ · · ·
+ 6 · · · · · · · ·
+ 7 · · · · · · · ·
+ 8 · · · · · · · ·
 """.strip("\n")
 
 def compile_lib(src: str, out: str) -> None:

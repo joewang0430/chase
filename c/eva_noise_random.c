@@ -7,7 +7,7 @@
 #include <math.h>
 
 // Keep midgame search depth and algorithms unchanged relative to eva_noise_3.c
-#define MIDGAME_DEPTH 5
+#define MIDGAME_DEPTH 7
 
 typedef uint64_t u64;
 
@@ -211,26 +211,28 @@ Board make_flips(Board board, int pos) {
 }
 
 static inline int middle_score(Board b) {
-    // Position-Specific Table (simple), mobility boost
-    static const int PST[64] = {
-        20, -10,  8,  8,  8,  8, -10, 20,
-       -10, -10,  3,  3,  3,  3, -10,-10,
-         8,   3,  3,  3,  3,  3,   3,  8,
-         8,   3,  3,  3,  3,  3,   3,  8,
-         8,   3,  3,  3,  3,  3,   3,  8,
-         8,   3,  3,  3,  3,  3,   3,  8,
-       -10, -10,  3,  3,  3,  3, -10,-10,
-        20, -10,  8,  8,  8,  8, -10, 20
-    };
-    int myScore = 0, oppScore = 0;
-    u64 my = MY_PIECES(b);
-    while (my) { int idx = __builtin_ctzll(my); my &= (my - 1); myScore += PST[idx]; }
-    u64 opp = OPP_PIECES(b);
-    while (opp){ int idx = __builtin_ctzll(opp); opp &= (opp - 1); oppScore += PST[idx]; }
-    int myMob = COUNT_BITS(generate_moves(b));
-    Board ob = b; SWAP_BOARD(ob);
-    int oppMob = COUNT_BITS(generate_moves(ob));
-    return (myScore + 5 * myMob) - (oppScore + 5 * oppMob);
+    // Adopt the ajex_bb_rvc.c midgame evaluation: piece count + corner control + mobility
+    const u64 CORNER_MASK = 0x8100000000000081ULL;
+    const int cornerW = 17;
+    const int mobilityW = 10;
+
+    int myPieces = COUNT_BITS(MY_PIECES(b));
+    int oppPieces = COUNT_BITS(OPP_PIECES(b));
+
+    u64 myCorners = MY_PIECES(b) & CORNER_MASK;
+    u64 oppCorners = OPP_PIECES(b) & CORNER_MASK;
+    int myCornerCnt = COUNT_BITS(myCorners);
+    int oppCornerCnt = COUNT_BITS(oppCorners);
+
+    u64 myMoves = generate_moves(b);
+    Board opp = b; SWAP_BOARD(opp);
+    u64 oppMoves = generate_moves(opp);
+    int myMob = COUNT_BITS(myMoves);
+    int oppMob = COUNT_BITS(oppMoves);
+
+    int myScore = myPieces + cornerW * myCornerCnt + mobilityW * myMob;
+    int oppScore = oppPieces + cornerW * oppCornerCnt + mobilityW * oppMob;
+    return myScore - oppScore;
 }
 
 static int midgame_search(Board board, int depth, int alpha, int beta) {

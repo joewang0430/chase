@@ -33,6 +33,41 @@ DATASET_DIR = os.path.join(ROOT, "dataset")
 RAW_DIR = os.path.join(DATASET_DIR, "raw")
 
 
+# ------------------------------
+# pcs -> p (oracle 概率基线) 映射表
+# 约定：
+# - pcs ∈ [12,25]   => p = 0.65
+# - pcs ∈ [26,39]   => p = 0.75
+# - pcs ∈ [40,53]   => p = 0.90
+# 只定义字典与取值函数，不改变其他流程。
+
+def _build_default_p_schedule() -> Dict[int, float]:
+    d: Dict[int, float] = {}
+    for pcs in range(12, 26):
+        d[pcs] = 0.65
+    for pcs in range(26, 40):
+        d[pcs] = 0.75
+    for pcs in range(40, 54):
+        d[pcs] = 0.90
+    return d
+
+
+# 模块级默认表：12..53 全覆盖
+P_SCHEDULE: Dict[int, float] = _build_default_p_schedule()
+
+
+def p_for_pcs(pcs: int, schedule: Optional[Dict[int, float]] = None, default: float = 0.75) -> float:
+    """根据子数 pcs 返回“原始基线”的 p（不含 net_win 拉回）。
+
+    仅做字典查表；默认表覆盖 12..53。若超界或缺失，返回 default。
+    """
+    m = P_SCHEDULE if schedule is None else schedule
+    try:
+        return float(m.get(int(pcs), float(default)))
+    except Exception:
+        return float(default)
+
+
 def _now_iso() -> str:
     """返回当前 UTC 时间的 ISO 字符串（到毫秒），用于 meta.json 时间戳。"""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int((time.time()%1)*1000):03d}Z"
@@ -210,6 +245,62 @@ def update_meta_params(meta_path: str, params: DatasetParams) -> None:
         print(f"[WARN] update_meta_params failed: {e}")
 
 
+# ------------------------------
+# p 值根据 net_win 的“拉回函数”（只提供函数，不改动调用点）
+
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    """把 x 夹到 [lo, hi]。"""
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def adjust_p_with_net_win(
+    p_base: float,
+    net_win: float,
+    *,
+    p_lo: float = 0.05,
+    p_hi: float = 0.95,
+    K: float = 0.5,
+    gamma: float = 1.2,
+) -> float:
+    """根据当前净胜子对基线 p 做方向性拉回。
+
+    公式（方案A-凸组合）：
+        w = clamp(net_win / 64, -1, 1)
+        s = clamp(K * |w| ** gamma, 0, 1)
+        p_target = p_lo (w>0 领先)；p_hi (w<0 落后)；w=0 则 p_target=p_base
+        p' = clamp((1 - s) * p_base + s * p_target, 0, 1)
+    """
+    # 规范化净胜子到 [-1,1]
+    try:
+        w = float(net_win) / 64.0
+    except Exception:
+        w = 0.0
+    w = _clamp(w, -1.0, 1.0)
+
+    # 拉动强度 s ∈ [0,1]
+    s = _clamp(K * (abs(w) ** float(gamma)), 0.0, 1.0)
+
+    # 目标值：领先(>0)往更随机的低 p 拉；落后(<0)往更稳的高 p 拉
+    if w > 0.0:
+        p_target = float(p_lo)
+    elif w < 0.0:
+        p_target = float(p_hi)
+    else:
+        p_target = float(p_base)
+
+    # 凸组合 + 夹到 [0,1]
+    try:
+        p0 = float(p_base)
+    except Exception:
+        p0 = 0.5
+    p_new = (1.0 - s) * p0 + s * p_target
+    return _clamp(p_new, 0.0, 1.0)
+
+
 def stage_from_pcs(pcs: int) -> int:
     """按约定把子数映射到阶段：1:[12,25], 2:[26,39], 3:[40,53]。
 
@@ -356,26 +447,26 @@ def main(argv: Optional[list[str]] = None) -> None:
     update_meta_params(rp.meta_path, params)
 
     # 4) 演示：写入极简“假数据”N 行，便于验证写入结构（不接 driver，不做合法性）
-    demo_n = int(getattr(args, "demo_lines", 0) or 0)
-    if demo_n > 0:
-        # 选择若干“目标子数”制造分段覆盖（只是演示）
-        pcs_targets = [14, 28, 40, 52]
-        game_id = f"demo_{_shortid(6)}"
-        for i in range(min(demo_n, len(pcs_targets))):
-            pcs_target = pcs_targets[i]
-            player = i % 2  # 交替当前方
-            my_bb, opp_bb = _mock_bitboards(pcs_target, player)
-            rec = build_record_skeleton(
-                game_id=game_id,
-                player=player,
-                my_bb=my_bb,
-                opp_bb=opp_bb,
-                best_moves=["d3", "c5"],  # 演示字段
-                net_win=0.0,                # 演示字段
-                engine_time=float(args.engine_time),
-                probe_ms=None,
-            )
-            writer.append_position(rec)
+    # demo_n = int(getattr(args, "demo_lines", 0) or 0)
+    # if demo_n > 0:
+    #     # 选择若干“目标子数”制造分段覆盖（只是演示）
+    #     pcs_targets = [14, 28, 40, 52]
+    #     game_id = f"demo_{_shortid(6)}"
+    #     for i in range(min(demo_n, len(pcs_targets))):
+    #         pcs_target = pcs_targets[i]
+    #         player = i % 2  # 交替当前方
+    #         my_bb, opp_bb = _mock_bitboards(pcs_target, player)
+    #         rec = build_record_skeleton(
+    #             game_id=game_id,
+    #             player=player,
+    #             my_bb=my_bb,
+    #             opp_bb=opp_bb,
+    #             best_moves=["d3", "c5"],  # 演示字段
+    #             net_win=0.0,                # 演示字段
+    #             engine_time=float(args.engine_time),
+    #             probe_ms=None,
+    #         )
+    #         writer.append_position(rec)
 
     writer.close()
     print("[DONE] run scaffold created. Writer opened and closed successfully.")

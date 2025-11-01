@@ -12,3 +12,5 @@ class WindowsDriver(SoftwareDriverBase):
         return
     def wait_and_read(self) -> Tuple[List[str], float]:
         raise NotImplementedError("Implement Windows UI reading")
+    def click_move(self, coord: str, delay: float = 0.12) -> None:
+        raise NotImplementedError("Implement Windows UI clicking")

@@ -14,6 +14,9 @@ Human notes (why this file exists):
     但会做最基本的 key/合法计数/stage 的占位（后续会在构造记录时计算）。
 """
 
+# 测试单个棋谱：
+# python3 auto/generate_dataset.py --collect-one --driver mac --no-compress
+
 from __future__ import annotations
 
 import os
@@ -34,6 +37,10 @@ import subprocess
 ROOT = os.path.dirname(os.path.dirname(__file__))  # repo root
 DATASET_DIR = os.path.join(ROOT, "dataset")
 RAW_DIR = os.path.join(DATASET_DIR, "raw")
+
+# 确保以 `python3 auto/generate_dataset.py` 方式运行时也能导入 `auto.*` 包
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 
 # ------------------------------
@@ -65,6 +72,70 @@ def p_for_pcs(pcs: int, schedule: Optional[Dict[int, float]] = None, default: fl
     仅做字典查表；默认表覆盖 12..53。若超界或缺失，返回 default。
     """
     m = P_SCHEDULE if schedule is None else schedule
+    try:
+        return float(m.get(int(pcs), float(default)))
+    except Exception:
+        return float(default)
+
+
+# ------------------------------
+# pcs -> engine_time（秒）映射表（12..53）。
+# 明确按键硬写，便于随手改动（不依赖构造函数）。
+# 约定：默认所有 pcs（12..53）均为 2.0 秒；按需可直接改任意键的值。
+
+ENGINE_TIME_SCHEDULE: Dict[int, float] = {
+    12: 2.0,
+    13: 2.0,
+    14: 2.0,
+    15: 2.0,
+    16: 2.0,
+    17: 2.0,
+    18: 2.0,
+    19: 2.0,
+    20: 2.0,
+    21: 2.0,
+    22: 2.0,
+    23: 2.0,
+    24: 2.0,
+    25: 2.0,
+    26: 2.0,
+    27: 2.0,
+    28: 2.0,
+    29: 2.0,
+    30: 2.0,
+    31: 2.0,
+    32: 2.0,
+    33: 2.0,
+    34: 2.0,
+    35: 2.0,
+    36: 2.0,
+    37: 2.0,
+    38: 2.0,
+    39: 2.0,
+    40: 2.0,
+    41: 2.0,
+    42: 2.0,
+    43: 2.0,
+    44: 2.0,
+    45: 2.0,
+    46: 2.0,
+    47: 2.0,
+    48: 2.0,
+    49: 2.0,
+    50: 2.0,
+    51: 2.0,
+    52: 2.0,
+    53: 2.0,
+}
+
+
+def engine_time_for_pcs(pcs: int, schedule: Optional[Dict[int, float]] = None, default: float = 6.0) -> float:
+    """根据 pcs 返回 engine_time（秒）。默认表覆盖 12..53；超界返回 default。
+
+    用法示例：engine_time_for_pcs(current_pcs) → 6.0
+    后续如需差异化，只需修改 ENGINE_TIME_SCHEDULE 对应键的数值。
+    """
+    m = ENGINE_TIME_SCHEDULE if schedule is None else schedule
     try:
         return float(m.get(int(pcs), float(default)))
     except Exception:
@@ -501,7 +572,10 @@ def opening_moves_7_to_8(
     mock: bool = False,
     rng: Optional[random.Random] = None,
 ) -> Tuple[List[str], int, int, str, List[Dict[str, Any]]]:
-    """推进第 7-8 手：每手 50% C 噪声，50% oracle（OCR 最佳点，多候选随机其一）。
+    """推进第 7-8 手：每手 50% C 噪声，50% oracle（OCR 最佳点取 top-1）。
+
+    随机性说明：为避免调用方传入的 rng（例如固定种子或被 1–6 手消耗）影响 7–8 的分支掷币，
+    此处改用 SystemRandom() 进行分支选择，使每次运行更接近“真实随机”。
 
     入参：截至 6 手的 moves_so_far、黑白位板、轮到方；
     返回：新增的 moves_7to8、更新位板和 side_to_move，以及每步的日志条目（来源/所选 move/net_win 等）。
@@ -510,6 +584,7 @@ def opening_moves_7_to_8(
     from auto.drivers import create_driver
     _ensure_play_funcs()
     rng = rng or random.Random()
+    sys_rng = random.SystemRandom()  # 仅用于分支掷币
     sampler = _CSampler()
 
     logs: List[Dict[str, Any]] = []
@@ -518,8 +593,13 @@ def opening_moves_7_to_8(
     white = int(white_bb)
     side = side_to_move.upper()
 
-    # 准备 driver（oracle 2s）
+    # 准备 driver（oracle 2s），不调用 solve()/reset/replay；只 ensure + wait_and_read + click
     drv = create_driver(engine_time=2.0, driver=driver_name, mock=mock)
+    # 只需确保一次应用在前台（不会重置盘面）
+    try:
+        drv.ensure_running()
+    except Exception as e:
+        raise RuntimeError(f"driver ensure_running failed: {e}")
 
     while len(new_moves) < 2:  # 两手，PASS 不计数
         # PASS 处理：不计数；若连续 PASS（虽然前 8 手不会出现），仍做防御
@@ -529,15 +609,24 @@ def opening_moves_7_to_8(
                 raise RuntimeError("consecutive PASS within first 8 moves")
             continue
 
-        use_oracle = rng.random() < 0.5
+        use_oracle = sys_rng.random() < 0.75
         if use_oracle:
-            # 用 UI 驱动读取“黄色最佳候选们”和 net_win；并从候选中随机一个
-            # 这里复用 complete_bts 的 solve 接口语义（回放 moves_so_far）
-            best_moves, net_win = drv.solve(moves_so_far)
+            # 直接读取（等待 engine_time 秒），取 top-1 最佳黄格。
+            best_moves, net_win = drv.wait_and_read()
             if not isinstance(best_moves, list) or len(best_moves) == 0:
                 raise RuntimeError(f"oracle returned empty best_moves: {best_moves}")
-            mv = rng.choice([str(m) for m in best_moves])
+            mv = str(best_moves[0])  # 只取第一名（不在候选间随机）
             pos = _mv_to_idx(mv)
+            # 严格校验合法性
+            me_chk, opp_chk = _black_white_to_my_opp(black, white, side)
+            legal = _legal_moves(me_chk, opp_chk)
+            if pos < 0 or pos > 63 or not (legal & (1 << pos)):
+                raise RuntimeError(f"oracle proposed illegal move {mv} (pos={pos}) at side={side}")
+            # 点击以保持 UI 同步
+            try:
+                drv.click_move(mv)
+            except Exception as e:
+                raise RuntimeError(f"driver click_move failed for {mv}: {e}")
             src = "oracle"
             logs.append({"src": src, "mv": mv, "net_win": float(net_win) if net_win is not None else None})
         else:
@@ -547,13 +636,18 @@ def opening_moves_7_to_8(
             if pos < 0 or pos > 63:
                 raise RuntimeError(f"C sampler returned invalid move: {pos}")
             mv = _idx_to_mv(pos)
+            # 点击以保持 UI 同步（不等待分析）
+            try:
+                drv.click_move(mv)
+            except Exception as e:
+                raise RuntimeError(f"driver click_move failed for {mv}: {e}")
             src = "noise"
             logs.append({"src": src, "mv": mv})
 
         # 应用到黑白位板 & 累积 moves_so_far
         black, white, side = _apply_on_bw(black, white, side, pos)
-    new_moves.append(mv)
-    moves_so_far.append(mv)
+        new_moves.append(mv)
+        moves_so_far.append(mv)
 
     return new_moves, black, white, side, logs
 
@@ -649,6 +743,221 @@ def build_record_skeleton(
     return rec
 
 
+def collect_game_12_to_53(
+    *,
+    writer: RunWriter,
+    driver_name: Optional[str] = None,
+    mock: bool = False,
+    rng: Optional[random.Random] = None,
+    params: Optional[DatasetParams] = None,
+    game_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """从开局推进到 53pcs，按每手 OCR 记录并选择 oracle/noise 点击落子。
+
+    流程（每手循环）：
+    - 若当前方无合法着法：PASS（不计数，不落盘），切换走子；若双方都无着法则终局。
+    - pcs -> engine_time；设置到 driver；OCR 读取 best_moves, net_win；
+    - 写本步记录（best_moves/net_win/engine_time/合法着点统计等）；
+    - 用“本步 net_win”调整“本步的 p”，SystemRandom 掷币：
+        - oracle：取 top-1（严格合法校验），click_move；
+        - noise：C 抽样一个合法点，click_move；
+    - 落子到位板，切换走子；pcs 达到 params.pcs_max(=53) 即结束。
+
+    返回：一个简短的 summary dict。
+    约定：本函数内部会自行创建/确保 driver 前台；开局 1-8 手复用现有实现，7-8 会点击到 UI 保持同步。
+    """
+    from auto.drivers import create_driver
+
+    _ensure_play_funcs()
+    rng = rng or random.Random()
+    cfg = params or DatasetParams()
+    sys_rng = random.SystemRandom()
+    sampler = _CSampler()
+
+    # 1) 开局 1-6（本地）
+    moves: List[str] = []
+    m1_6, black, white, side = opening_moves_1_to_6(rng=rng)
+    moves.extend(m1_6)
+
+    # 2) 第 7-8 手（保证 UI 同步：内部 ensure + wait_and_read/click）
+    # 先把 UI 同步到内存中的 1–6 手终局：reset -> replay(1..6)
+    try:
+        from auto.drivers import create_driver as _create_driver_sync  # 局部导入避免顶层依赖
+        drv_sync = _create_driver_sync(engine_time=2.0, driver=driver_name, mock=mock)
+        drv_sync.ensure_running()
+        if hasattr(drv_sync, "reset_board"):
+            drv_sync.reset_board()
+        if hasattr(drv_sync, "replay_moves"):
+            drv_sync.replay_moves(m1_6)
+        time.sleep(0.20)  # 稍作等待，避免动画/评估未稳定
+    except Exception as e:
+        raise RuntimeError(f"failed to sync UI to opening 1–6: {e}")
+
+    m7_8, black, white, side, logs78 = opening_moves_7_to_8(
+        moves_so_far=moves,
+        black_bb=black,
+        white_bb=white,
+        side_to_move=side,
+        driver_name=driver_name,
+        mock=mock,
+        rng=rng,
+    )
+    moves.extend(m7_8)
+
+    # 3) 准备 midgame driver（不 reset，不 replay；只用于 OCR 与点击）
+    drv = create_driver(engine_time=2.0, driver=driver_name, mock=mock)
+    try:
+        drv.ensure_running()
+    except Exception as e:
+        raise RuntimeError(f"driver ensure_running failed: {e}")
+
+    gid = game_id or f"g_{_shortid(8)}"
+    steps_written = 0
+    oracle_moves = 0
+    noise_moves = 0
+    pass_moves = 0
+
+    def _both_no_legal(b: int, w: int, s: str) -> bool:
+        if not _has_legal(b, w, s):
+            s2 = 'W' if s == 'B' else 'B'
+            return not _has_legal(b, w, s2)
+        return False
+
+    # 4) 主循环：直到 53pcs 或无子可下
+    while True:
+        # 终止条件
+        if _both_no_legal(black, white, side):
+            break
+
+        # PASS：不计数不写盘
+        if not _has_legal(black, white, side):
+            pass_moves += 1
+            side = 'W' if side == 'B' else 'B'
+            continue
+
+        pcs = compute_pcs(black, white)
+        # 达到上限直接结束（不再生成新着）
+        if pcs >= cfg.pcs_max:
+            break
+
+        # 当前步分析时间（按 pcs 表设置）
+        et = engine_time_for_pcs(pcs)
+        drv.engine_time = float(et)
+
+        # OCR 读取（容错：失败重试一次）
+        best_moves: List[str] = []
+        net_win: Optional[float] = None
+        for _try in range(2):
+            try:
+                bm, nw = drv.wait_and_read()
+                if isinstance(bm, list) and len(bm) > 0:
+                    best_moves = [str(m) for m in bm]
+                net_win = float(nw) if nw is not None else None
+                break
+            except Exception:
+                best_moves = []
+                net_win = None
+
+        # 记录本步（若在采集区间且非 PASS）
+        me, opp = _black_white_to_my_opp(black, white, side)
+        legal_bb = _legal_moves(me, opp)
+        legal_cnt = bit_count(legal_bb)
+
+        # 严格要求：一旦 OCR 的 top-1 不在当前走方的合法集合中，立即报错并退出
+        if best_moves:
+            try:
+                top_mv = str(best_moves[0])
+                top_pos = _mv_to_idx(top_mv)
+            except Exception:
+                top_mv = str(best_moves[0])
+                top_pos = -1
+            if top_pos < 0 or not (legal_bb & (1 << top_pos)):
+                pcs_dbg = compute_pcs(black, white)
+                raise RuntimeError(
+                    f"OCR top-1 illegal: mv={top_mv} pos={top_pos} side={side} pcs={pcs_dbg} legal_count={legal_cnt}"
+                )
+        if should_capture(pcs, False, cfg):
+            rec = build_record_skeleton(
+                game_id=gid,
+                player=(0 if side == 'B' else 1),
+                my_bb=me,
+                opp_bb=opp,
+                legal_bb=legal_bb,
+                legal_count=legal_cnt,
+                best_moves=best_moves if best_moves else None,
+                net_win=net_win,
+                engine_time=et,
+                probe_ms=None,
+            )
+            writer.append_position(rec)
+            steps_written += 1
+
+        # 决策：当步 p = adjust_p_with_net_win(p_for_pcs(pcs), net_win)
+        p0 = p_for_pcs(pcs)
+        p_adj = adjust_p_with_net_win(p0, net_win if net_win is not None else 0.0)
+        use_oracle = sys_rng.random() < p_adj
+
+        # 产生并点击落子
+        pos: Optional[int] = None
+        mv: Optional[str] = None
+        if use_oracle and best_moves:
+            mv = str(best_moves[0])
+            pos = _mv_to_idx(mv)
+            if pos < 0 or not (legal_bb & (1 << pos)):
+                # 严格：OCR top-1 非法 → 立即错误并退出
+                raise RuntimeError(
+                    f"OCR top-1 illegal: mv={mv} pos={pos} side={side} pcs={pcs} legal_count={legal_cnt}"
+                )
+
+        if not use_oracle:
+            # 噪声：采样一个合法点
+            me2, opp2 = me, opp
+            for _ in range(3):  # 最多尝试 3 次
+                cand = sampler.choose_move(me2, opp2)
+                if 0 <= cand <= 63 and (legal_bb & (1 << cand)):
+                    pos = cand
+                    mv = _idx_to_mv(pos)
+                    break
+            if mv is None or pos is None:
+                # 兜底：取最低位合法点
+                if legal_bb == 0:
+                    # 理论上不会发生（上面已检查 has_legal）
+                    side = 'W' if side == 'B' else 'B'
+                    continue
+                lsb = (legal_bb & -legal_bb)
+                pos = (lsb.bit_length() - 1)
+                mv = _idx_to_mv(pos)
+
+        # 点击（保持 UI 同步）
+        try:
+            assert mv is not None and pos is not None
+            drv.click_move(mv)
+        except Exception as e:
+            raise RuntimeError(f"driver click_move failed for {mv}: {e}")
+
+        # 应用到位板
+        assert pos is not None
+        black, white, side = _apply_on_bw(black, white, side, pos)
+        moves.append(mv)  # type: ignore[arg-type]
+        if use_oracle:
+            oracle_moves += 1
+        else:
+            noise_moves += 1
+
+        # 结束条件：落子后 pcs 达到上限
+        if compute_pcs(black, white) >= cfg.pcs_max:
+            break
+
+    return {
+        "game_id": gid,
+        "moves": moves,
+        "steps_written": steps_written,
+        "oracle": oracle_moves,
+        "noise": noise_moves,
+        "pass": pass_moves,
+    }
+
+
 def _mock_bitboards(total_pcs: int, player: int) -> Tuple[int, int]:
     """合成一对“互不重叠”的 bitboard，以便演示：
     - 低位给对手，高位给当前方；
@@ -679,19 +988,23 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--engine-time", type=float, default=4.0, help="seconds budget for Sensei solving")
     ap.add_argument("--early-random", type=int, default=6, help="number of early random moves")
     ap.add_argument("--demo-lines", type=int, default=2, help="write N mock records for a dry-run demo")
+    # 采集开关（可选）：运行一盘 12..53 并写盘
+    ap.add_argument("--collect-one", action="store_true", help="run one midgame collection (12..53 pcs) and write records")
+    ap.add_argument("--driver", type=str, default=None, help="driver name, e.g., mac/mock/windows/linux")
+    ap.add_argument("--mock", action="store_true", help="use mock driver (no UI)")
     # 提前占个位：后续会新增 --driver/--time-budget/--games 等参数
     return ap.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    """程序入口：创建 run 目录，初始化 writer（先演示打开/关闭）。"""
+    """程序入口：创建 run 目录，初始化 writer（可选运行一盘 12..53 采集）。"""
     args = parse_args(argv)
 
     # 1) 创建 run 目录 + 写 meta.json
     rp = start_new_run()
     print(f"[RUN] {rp.run_dir}")
 
-    # 2) 准备 chunked writer（此处仅演示打开与关闭，后续会写入真实样本）
+    # 2) 准备 chunked writer
     writer = RunWriter(
         base_dir=rp.run_dir,
         chunk_lines=int(args.chunk_lines),
@@ -703,27 +1016,17 @@ def main(argv: Optional[list[str]] = None) -> None:
     params = DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random))
     update_meta_params(rp.meta_path, params)
 
-    # 4) 演示：写入极简“假数据”N 行，便于验证写入结构（不接 driver，不做合法性）
-    # demo_n = int(getattr(args, "demo_lines", 0) or 0)
-    # if demo_n > 0:
-    #     # 选择若干“目标子数”制造分段覆盖（只是演示）
-    #     pcs_targets = [14, 28, 40, 52]
-    #     game_id = f"demo_{_shortid(6)}"
-    #     for i in range(min(demo_n, len(pcs_targets))):
-    #         pcs_target = pcs_targets[i]
-    #         player = i % 2  # 交替当前方
-    #         my_bb, opp_bb = _mock_bitboards(pcs_target, player)
-    #         rec = build_record_skeleton(
-    #             game_id=game_id,
-    #             player=player,
-    #             my_bb=my_bb,
-    #             opp_bb=opp_bb,
-    #             best_moves=["d3", "c5"],  # 演示字段
-    #             net_win=0.0,                # 演示字段
-    #             engine_time=float(args.engine_time),
-    #             probe_ms=None,
-    #         )
-    #         writer.append_position(rec)
+    # 4) 预留：后续加 --collect-one / --driver 等参数触发真实采集。
+    if getattr(args, "collect_one", False):
+        print("[COLLECT] start one game 12..53 …")
+        summary = collect_game_12_to_53(
+            writer=writer,
+            driver_name=getattr(args, "driver", None),
+            mock=bool(getattr(args, "mock", False)),
+            rng=random.Random(),
+            params=DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random)),
+        )
+        print(f"[COLLECT] done: steps={summary.get('steps_written')} oracle={summary.get('oracle')} noise={summary.get('noise')} pass={summary.get('pass')}")
 
     writer.close()
     print("[DONE] run scaffold created. Writer opened and closed successfully.")

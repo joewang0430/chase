@@ -659,7 +659,7 @@ def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None)
     from PIL import Image
 
     # 1) 定位：按每格黄像素面积排序
-    candidates, mask = _detect_best_cells_by_mask(img_pil, top_k=3, debug_dir=debug_dir)
+    candidates, mask = _detect_best_cells_by_mask(img_pil, top_k=None, debug_dir=debug_dir)
     if not candidates:
         raise RuntimeError("no yellow found on board (mask empty)")
 
@@ -760,6 +760,24 @@ class MacDriver(SoftwareDriverBase):
         print(f"[T] ensure: stabilize {(time.perf_counter()-t0)*1000:.0f} ms")
 
         print(f"[T] ensure: total {(time.perf_counter()-t_total):.2f} s")
+
+    def click_move(self, coord: str, delay: float = 0.12) -> None:
+        """Click a single board coordinate like 'd3' using current calibration.
+
+        Assumes the app is already running and the board is visible. Does not call
+        reset/replay; just performs a click at the mapped pixel and waits a short delay.
+        """
+        import pyautogui
+        pyautogui.FAILSAFE = False
+        cfg = _load_calib()
+        wx, wy, ww, wh = _get_window_bounds(APP_NAME)
+        board_rel = cfg.get("board_rel")
+        if not (isinstance(board_rel, list) and len(board_rel) == 4):
+            raise FileNotFoundError(f"board_rel missing in {CALIB_PATH}. Run --probe-calibrate first.")
+        bx, by, bw, bh = board_rel
+        x, y = _coord_to_xy(coord.strip(), (wx, wy, ww, wh), (bx, by, bw, bh))
+        pyautogui.click(x, y)
+        time.sleep(float(delay))
 
     # 探针：窗口截图探针，供 --probe-snap 使用
     def snap_window(self, out_path: str) -> str:

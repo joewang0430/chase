@@ -14,3 +14,6 @@ class MockDriver(SoftwareDriverBase):
     def wait_and_read(self) -> Tuple[List[str], float]:
         time.sleep(min(0.02, self.engine_time))
         return ["a1"], 0.0
+    def click_move(self, coord: str, delay: float = 0.12) -> None:
+        # no-op in mock
+        time.sleep(min(0.01, delay))

@@ -17,6 +17,21 @@ Human notes (why this file exists):
 # 测试单个棋谱：
 # python3 auto/generate_dataset.py --collect-one --driver mac --no-compress
 
+# 在 600 秒内尽量多采（但每盘会完整结束） 上限是600秒，因为 --games 很大：
+# python3 auto/generate_dataset.py --collect-one --driver mac --time-budget 300 --games 9999 --no-compress
+
+# 采 10 局，不压缩：
+# python3 auto/generate_dataset.py --collect-one --driver mac --games 10 --no-compress
+
+# 上面的的命令行例子都不 compress
+
+'''
+TODO: after 11.1:
+    1. 更改 p 的拉回函数，当前的太线性，0-10 和 10-20 都太一致，要让 0-10 的拉回度增长远高于 10-20. 可以先试试修改 k 值，但是大概率得改整个函数公式。
+    2. 修改每一个 pcs 阶段对应的 engine_time。实现合理效率，但 注重准确定优先。
+    3. 测试无误，开跑。
+'''
+
 from __future__ import annotations
 
 import os
@@ -992,6 +1007,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--collect-one", action="store_true", help="run one midgame collection (12..53 pcs) and write records")
     ap.add_argument("--games", type=int, default=1, help="number of games to collect when --collect-one is set")
     ap.add_argument("--seed", type=int, default=None, help="base random seed (per game adds +i)")
+    ap.add_argument("--time-budget", type=float, default=None, help="seconds budget for multi-game collection; finish the current game after crossing the deadline, then stop")
     ap.add_argument("--driver", type=str, default=None, help="driver name, e.g., mac/mock/windows/linux")
     ap.add_argument("--mock", action="store_true", help="use mock driver (no UI)")
     # 提前占个位：后续会新增 --driver/--time-budget/--games 等参数
@@ -1024,31 +1040,59 @@ def main(argv: Optional[list[str]] = None) -> None:
         total_oracle = 0
         total_noise = 0
         total_pass = 0
-        games = max(1, int(getattr(args, "games", 1)))
+        done_games = 0
+        games_target = max(1, int(getattr(args, "games", 1)))
         base_seed = getattr(args, "seed", None)
-        print(f"[COLLECT] start {games} game(s) 12..53 …")
-        for i in range(games):
-            if base_seed is not None:
-                rng = random.Random(int(base_seed) + i)
-            else:
-                rng = random.Random()
-            summary = collect_game_12_to_53(
-                writer=writer,
-                driver_name=getattr(args, "driver", None),
-                mock=bool(getattr(args, "mock", False)),
-                rng=rng,
-                params=DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random)),
-            )
-            print(
-                f"[COLLECT] game#{i+1}: steps={summary.get('steps_written')} oracle={summary.get('oracle')} "
-                f"noise={summary.get('noise')} pass={summary.get('pass')}"
-            )
-            total_steps += int(summary.get('steps_written') or 0)
-            total_oracle += int(summary.get('oracle') or 0)
-            total_noise += int(summary.get('noise') or 0)
-            total_pass += int(summary.get('pass') or 0)
+        time_budget = getattr(args, "time_budget", None)
+        t_start = time.time()
+        deadline = (t_start + float(time_budget)) if (time_budget is not None) else None
+
+        if deadline is not None:
+            print(f"[COLLECT] start (time-budget={float(time_budget):.2f}s, up to {games_target} game(s)) …")
+        else:
+            print(f"[COLLECT] start (up to {games_target} game(s)) …")
+
+        i = 0
+        try:
+            while i < games_target:
+                # 若设了 time budget：只有在未到截止时才开始新的一盘
+                if deadline is not None and time.time() >= deadline:
+                    break  # 不再开启新盘
+
+                # per-game RNG（若提供种子的话）
+                rng = random.Random(int(base_seed) + i) if base_seed is not None else random.Random()
+
+                print(f"[COLLECT] game#{i+1} starting …")
+                summary = collect_game_12_to_53(
+                    writer=writer,
+                    driver_name=getattr(args, "driver", None),
+                    mock=bool(getattr(args, "mock", False)),
+                    rng=rng,
+                    params=DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random)),
+                )
+                done_games += 1
+                i += 1
+
+                print(
+                    f"[COLLECT] game#{i}: steps={summary.get('steps_written')} "
+                    f"oracle={summary.get('oracle')} noise={summary.get('noise')} pass={summary.get('pass')}"
+                )
+                total_steps += int(summary.get('steps_written') or 0)
+                total_oracle += int(summary.get('oracle') or 0)
+                total_noise += int(summary.get('noise') or 0)
+                total_pass += int(summary.get('pass') or 0)
+
+                # 若设置了时间预算，且完成这一盘后已越过截止时间，则到此为止（满足“超过限时的第一盘结束后停止”）
+                if deadline is not None and time.time() >= deadline:
+                    print("[COLLECT] time budget reached after finishing current game; stopping …")
+                    break
+        except KeyboardInterrupt:
+            print("\n[COLLECT] interrupted by user; finishing up …")
+
+        elapsed = time.time() - t_start
         print(
-            f"[COLLECT] all done: games={games} steps={total_steps} oracle={total_oracle} noise={total_noise} pass={total_pass}"
+            f"[COLLECT] all done: games={done_games} steps={total_steps} oracle={total_oracle} "
+            f"noise={total_noise} pass={total_pass} elapsed={elapsed:.2f}s"
         )
 
     writer.close()

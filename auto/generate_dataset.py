@@ -990,6 +990,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--demo-lines", type=int, default=2, help="write N mock records for a dry-run demo")
     # 采集开关（可选）：运行一盘 12..53 并写盘
     ap.add_argument("--collect-one", action="store_true", help="run one midgame collection (12..53 pcs) and write records")
+    ap.add_argument("--games", type=int, default=1, help="number of games to collect when --collect-one is set")
+    ap.add_argument("--seed", type=int, default=None, help="base random seed (per game adds +i)")
     ap.add_argument("--driver", type=str, default=None, help="driver name, e.g., mac/mock/windows/linux")
     ap.add_argument("--mock", action="store_true", help="use mock driver (no UI)")
     # 提前占个位：后续会新增 --driver/--time-budget/--games 等参数
@@ -1018,15 +1020,36 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     # 4) 预留：后续加 --collect-one / --driver 等参数触发真实采集。
     if getattr(args, "collect_one", False):
-        print("[COLLECT] start one game 12..53 …")
-        summary = collect_game_12_to_53(
-            writer=writer,
-            driver_name=getattr(args, "driver", None),
-            mock=bool(getattr(args, "mock", False)),
-            rng=random.Random(),
-            params=DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random)),
+        total_steps = 0
+        total_oracle = 0
+        total_noise = 0
+        total_pass = 0
+        games = max(1, int(getattr(args, "games", 1)))
+        base_seed = getattr(args, "seed", None)
+        print(f"[COLLECT] start {games} game(s) 12..53 …")
+        for i in range(games):
+            if base_seed is not None:
+                rng = random.Random(int(base_seed) + i)
+            else:
+                rng = random.Random()
+            summary = collect_game_12_to_53(
+                writer=writer,
+                driver_name=getattr(args, "driver", None),
+                mock=bool(getattr(args, "mock", False)),
+                rng=rng,
+                params=DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random)),
+            )
+            print(
+                f"[COLLECT] game#{i+1}: steps={summary.get('steps_written')} oracle={summary.get('oracle')} "
+                f"noise={summary.get('noise')} pass={summary.get('pass')}"
+            )
+            total_steps += int(summary.get('steps_written') or 0)
+            total_oracle += int(summary.get('oracle') or 0)
+            total_noise += int(summary.get('noise') or 0)
+            total_pass += int(summary.get('pass') or 0)
+        print(
+            f"[COLLECT] all done: games={games} steps={total_steps} oracle={total_oracle} noise={total_noise} pass={total_pass}"
         )
-        print(f"[COLLECT] done: steps={summary.get('steps_written')} oracle={summary.get('oracle')} noise={summary.get('noise')} pass={summary.get('pass')}")
 
     writer.close()
     print("[DONE] run scaffold created. Writer opened and closed successfully.")

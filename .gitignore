@@ -15,6 +15,7 @@ __pycache__/
 *$py.class
 *.jsonl
 *.pt
+*.bak
 
 .env
 

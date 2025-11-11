@@ -10,6 +10,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Tuple
 
 # 添加 Python 3.6 兼容 popcount (替换 int.bit_count)
 POPCNT8 = [bin(i).count('1') for i in range(256)]
@@ -55,6 +56,68 @@ def shift_ne(bb: int) -> int: return (bb & NOT_FILE_H) >> 7
 def shift_nw(bb: int) -> int: return (bb & NOT_FILE_A) >> 9
 def shift_se(bb: int) -> int: return ((bb & NOT_FILE_H) << 9) & FULL_MASK
 def shift_sw(bb: int) -> int: return ((bb & NOT_FILE_A) << 7) & FULL_MASK
+
+# 旋转/镜像工具（内联，避免平台导入依赖）
+class Rotators:
+    @staticmethod
+    def up_diag_mirror(me: int, opp: int) -> Tuple[int, int]:
+        """
+        反对角线（↗）镜像：(r,c)->(7-c,7-r)
+        """
+        def _mirror(bb: int) -> int:
+            if bb == 0:
+                return 0
+            res = 0
+            x = bb
+            while x:
+                lsb = x & -x
+                i = lsb.bit_length() - 1
+                r, c = divmod(i, 8)
+                j = (7 - c) * 8 + (7 - r)
+                res |= (1 << j)
+                x ^= lsb
+            return res
+        return _mirror(me), _mirror(opp)
+
+    @staticmethod
+    def down_diag_mirror(me: int, opp: int) -> Tuple[int, int]:
+        """
+        主对角线（↘）镜像：(r,c)->(c,r)
+        """
+        def _mirror(bb: int) -> int:
+            if bb == 0:
+                return 0
+            res = 0
+            x = bb
+            while x:
+                lsb = x & -x
+                i = lsb.bit_length() - 1
+                r, c = divmod(i, 8)
+                j = c * 8 + r
+                res |= (1 << j)
+                x ^= lsb
+            return res
+        return _mirror(me), _mirror(opp)
+
+    @staticmethod
+    def rotation_180(me: int, opp: int) -> Tuple[int, int]:
+        """
+        180° 旋转：(r,c)->(7-r,7-c)
+        """
+        def _rot(bb: int) -> int:
+            if bb == 0:
+                return 0
+            res = 0
+            x = bb
+            while x:
+                lsb = x & -x
+                i = lsb.bit_length() - 1
+                r, c = divmod(i, 8)
+                j = (7 - r) * 8 + (7 - c)
+                res |= (1 << j)
+                x ^= lsb
+            return res
+        return _rot(me), _rot(opp)
 
 def legal_moves(me: int, opp: int) -> int:
     """生成 me 的合法着点位棋盘（位=1 表示可落子）。"""
@@ -258,6 +321,12 @@ class OthelloAI:
         self.ENDGAME_VALUE_THRESHOLD = 10  # MCTS 评估截点
         # 调试信息
         self.endgame_error = None  # 记录 ctypes 加载 / 调用失败原因
+        # 开局棋谱（full_book）
+        self.book_loaded = False
+        self.book = {}
+        self.book_path = None
+        self.book_error = None
+        self.book_used_move = False
 
     # @@ NN part begins
         # 三个模型（前两段 128 通道，末段 96 通道）
@@ -299,6 +368,118 @@ class OthelloAI:
                 self.nn_errors[idx] = f"{type(e).__name__}:{msg}"
         self.nn_total_load_ms = (time.perf_counter() - t0) * 1000.0
     # @@ NN part ends
+
+    # --- 开局棋谱加载 ---
+    def load_book(self):
+        if self.book_loaded:
+            return
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base_dir, 'data', 'full_book.jsonl')
+        self.book_path = path
+        if not os.path.exists(path):
+            self.book_error = 'not_found'
+            self.book_loaded = True
+            return
+        loaded = 0
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    key = obj.get('key')
+                    moves = obj.get('best_moves')
+                    if isinstance(key, str) and isinstance(moves, list) and moves:
+                        mv_list = [m for m in moves if isinstance(m, str) and m]
+                        if mv_list:
+                            self.book[key] = mv_list
+                            loaded += 1
+            self.book_error = None
+        except Exception as e:
+            self.book_error = f"load:{type(e).__name__}"
+        self.book_loaded = True
+        self.book_loaded_count = loaded
+
+    def _transform_pos(self, mode: str, pos: int) -> int:
+        """对单个格点 index (0..63) 应用与棋盘相同的对称变换。"""
+        r, c = divmod(pos, 8)
+        if mode == 'identity':
+            nr, nc = r, c
+        elif mode == 'up':  # (r,c)->(7-c,7-r)
+            nr, nc = 7 - c, 7 - r
+        elif mode == 'down':  # (r,c)->(c,r)
+            nr, nc = c, r
+        elif mode == 'rot180':  # (r,c)->(7-r,7-c)
+            nr, nc = 7 - r, 7 - c
+        else:
+            nr, nc = r, c
+        return nr * 8 + nc
+
+    # --- 开局棋谱查询（仅前 8 步 / 前 12 颗子） ---
+    def try_book_move(self):
+        # 先判断是否在前 8 步（≤12 子）；否则直接跳过，不加载棋谱
+        discs = popcount(self.my_pieces | self.opp_pieces)
+        if discs > 12:
+            return None
+        # 仅在需要使用棋谱时才尝试加载
+        self.load_book()
+        if self.book_error is not None or not self.book:
+            return None
+        # 以真实颜色构造 (black, white) 位棋盘
+        if self.my_color == 1:
+            black_bb = self.my_pieces
+            white_bb = self.opp_pieces
+        else:
+            black_bb = self.opp_pieces
+            white_bb = self.my_pieces
+        turn_letter = 'B' if self.my_color == 1 else 'W'
+
+        # 使用本文件内联的 Rotators（无外部导入）
+        variants = []
+        variants.append((black_bb, white_bb, 'identity'))
+        b1, w1 = Rotators.up_diag_mirror(black_bb, white_bb)
+        variants.append((b1, w1, 'up'))
+        b2, w2 = Rotators.down_diag_mirror(black_bb, white_bb)
+        variants.append((b2, w2, 'down'))
+        b3, w3 = Rotators.rotation_180(black_bb, white_bb)
+        variants.append((b3, w3, 'rot180'))
+
+        for b_t, w_t, mode in variants:
+            key = f"{b_t:016x}_{w_t:016x}_{turn_letter}"
+            # 查找生成的 key
+            moves_list = self.book.get(key)
+            if not moves_list:
+                continue
+            # 随机选择一个（未来 best_moves 可能有多个）
+            mv = random.choice(moves_list)
+            if not isinstance(mv, str) or len(mv) < 2:
+                continue
+            ms = mv.lower()
+            if ms == 'pass':
+                self.book_used_move = True
+                return (-1, -1)
+            col_ch = ms[0]
+            row_part = ms[1:]
+            if col_ch < 'a' or col_ch > 'h':
+                continue
+            try:
+                row_num = int(row_part)
+            except ValueError:
+                continue
+            if row_num < 1 or row_num > 8:
+                continue
+            col_idx = ord(col_ch) - ord('a')
+            row_idx = row_num - 1
+            pos_canonical = row_idx * 8 + col_idx
+            pos_actual = self._transform_pos(mode, pos_canonical)
+            ar, ac = divmod(pos_actual, 8)
+            self.book_used_move = True
+            return ar, ac
+        return None
 
     # --- 坐标与位操作 ---
     # bit_to_xy / set_bit 已抽到模块级函数
@@ -410,7 +591,12 @@ class OthelloAI:
 
     def choose_move(self):
         """决策入口：优先终局求解，其次普通位运算首合法点"""
-        # 1. 终局精确搜索
+        # 1. 开局棋谱（前 8 步 / 前 12 颗子）
+        self.book_used_move = False
+        book_mv = self.try_book_move()
+        if book_mv is not None:
+            return book_mv
+        # 0. 终局精确搜索
         empties = 64 - popcount(self.my_pieces | self.opp_pieces)
         if empties <= self.ENDGAME_MOVE_THRESHOLD:
             eg_result = self.endgame_search()
@@ -435,9 +621,9 @@ class OthelloAI:
         统一构造 debug 字段，返回形如：
         "empties=xx;flag=...;val=...;t=...;msg=..."
         """
-        mcts_fn_flag = random.randint(100, 109)     # 100-109 mcts 搜索被执行
-        endgame_fn_flag = random.randint(110, 119)  # 110-119 进入残局，且枚举 endgame 成功加载
-        # book_flag = random.randint(120, 129)        # 120-129 棋谱被调用
+        mcts_fn_flag = 200     # 200 mcts 搜索被执行
+        endgame_fn_flag = 300  # 300 进入残局，且枚举 endgame 成功加载
+        book_fn_flag = 100        # 100 棋谱被调用
         botzone_time = "DNE"
         botzone_value = "DNE"
         botzone_flag = "DNE"
@@ -505,6 +691,17 @@ class OthelloAI:
                     dbg_parts.append("bench3=" + ','.join(parts))
             elif hasattr(self, "nn_bench_err"):
                 dbg_parts.append(f"bench_err={self.nn_bench_err}")
+        # 若使用棋谱，覆盖 flag & 在 msg 后附加 BOOK 标记
+        if getattr(self, 'book_used_move', False):
+            # 替换 flag=...
+            for i, part in enumerate(dbg_parts):
+                if part.startswith('flag='):
+                    dbg_parts[i] = f'flag={book_fn_flag}'
+                if part.startswith('msg='):
+                    dbg_parts[i] = part + '|BOOK'
+            # 附加棋谱条目计数（可选）
+            if hasattr(self, 'book_loaded_count'):
+                dbg_parts.append(f'book_entries={self.book_loaded_count}')
         return ';'.join(dbg_parts)
     # @@ NN part ends
 

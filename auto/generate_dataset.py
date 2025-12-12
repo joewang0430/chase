@@ -879,6 +879,7 @@ def collect_game_12_to_53(
 
     gid = game_id or f"g_{_shortid(8)}"
     steps_written = 0
+    pending_records: List[Dict[str, Any]] = []
     oracle_moves = 0
     noise_moves = 0
     pass_moves = 0
@@ -955,8 +956,7 @@ def collect_game_12_to_53(
                 engine_time=et,
                 probe_ms=None,
             )
-            writer.append_position(rec)
-            steps_written += 1
+            pending_records.append(rec)
 
         # 决策：使用新策略，仅依赖 net_win 计算 p
         p_adj = adjust_p_with_net_win_new(net_win if net_win is not None else 0.0)
@@ -1012,6 +1012,11 @@ def collect_game_12_to_53(
         # 结束条件：落子后 pcs 达到上限
         if compute_pcs(black, white) >= cfg.pcs_max:
             break
+
+    # 正常结束：一次性把本盘缓存写入
+    for rec in pending_records:
+        writer.append_position(rec)
+    steps_written = len(pending_records)
 
     return {
         "game_id": gid,

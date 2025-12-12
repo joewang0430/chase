@@ -903,8 +903,8 @@ def collect_game_12_to_53(
             continue
 
         pcs = compute_pcs(black, white)
-        # 达到上限直接结束（不再生成新着）
-        if pcs >= cfg.pcs_max:
+        # 超过上限直接结束；等于上限仍需记录这一手
+        if pcs > cfg.pcs_max:
             break
 
         # 当前步分析时间（按 pcs 表设置）
@@ -958,6 +958,10 @@ def collect_game_12_to_53(
             )
             pending_records.append(rec)
 
+        # pcs 达到上限（例如 53）时：只记录，不再产生/点击下一步，直接结束
+        if pcs == cfg.pcs_max:
+            break
+
         # 决策：使用新策略，仅依赖 net_win 计算 p
         p_adj = adjust_p_with_net_win_new(net_win if net_win is not None else 0.0)
         use_oracle = sys_rng.random() < p_adj
@@ -1009,8 +1013,9 @@ def collect_game_12_to_53(
         else:
             noise_moves += 1
 
-        # 结束条件：落子后 pcs 达到上限
-        if compute_pcs(black, white) >= cfg.pcs_max:
+        # 结束条件：落子后 pcs 超过上限（>max）才结束；
+        # 等于上限（==max）留到下一轮开头记录后立即停止。
+        if compute_pcs(black, white) > cfg.pcs_max:
             break
 
     # 正常结束：一次性把本盘缓存写入

@@ -1,3 +1,20 @@
+from __future__ import annotations
+
+import os
+import re
+import sys
+import json
+import time
+import gzip
+import uuid
+import argparse
+from dataclasses import dataclass
+from typing import Optional, IO, Dict, Any, Tuple, List
+import random
+import ctypes
+import subprocess
+import math
+
 #!/usr/bin/env python3
 """
 Dataset generator (part 1): run bootstrap + chunked writer.
@@ -23,6 +40,9 @@ Human notes (why this file exists):
 # 采 10 局，不压缩：
 # python3 auto/generate_dataset.py --collect-one --driver mac --games 10 --no-compress
 
+# 7 小时
+# python3 auto/generate_dataset.py --collect-one --driver mac --time-budget 25200 --games 9999 --no-compress
+
 # 上面的的命令行例子都不 compress
 
 '''
@@ -33,21 +53,13 @@ TODO: after 11.1:
     (4). 除此之外可能整个棋谱对弈逻辑都得改。
 '''
 
-from __future__ import annotations
-
-import os
-import re
-import sys
-import json
-import time
-import gzip
-import uuid
-import argparse
-from dataclasses import dataclass
-from typing import Optional, IO, Dict, Any, Tuple, List
-import random
-import ctypes
-import subprocess
+'''
+TODO: after 11.1:
+    1. best_moves 这部分目前好像还是只记录一个，我希望有多少记录多少。
+    2. othello sensei 引擎崩溃问题得解决。
+    3. 测试无误，开跑。
+    (4). 除此之外可能整个棋谱对弈逻辑都得改。
+'''
 
 
 ROOT = os.path.dirname(os.path.dirname(__file__))  # repo root
@@ -100,48 +112,51 @@ def p_for_pcs(pcs: int, schedule: Optional[Dict[int, float]] = None, default: fl
 # 约定：默认所有 pcs（12..53）均为 2.0 秒；按需可直接改任意键的值。
 
 ENGINE_TIME_SCHEDULE: Dict[int, float] = {
-    12: 2.0,
-    13: 2.0,
-    14: 2.0,
-    15: 2.0,
-    16: 2.0,
-    17: 2.0,
-    18: 2.0,
-    19: 2.0,
-    20: 2.0,
-    21: 2.0,
-    22: 2.0,
-    23: 2.0,
-    24: 2.0,
-    25: 2.0,
-    26: 2.0,
-    27: 2.0,
-    28: 2.0,
-    29: 2.0,
-    30: 2.0,
-    31: 2.0,
-    32: 2.0,
-    33: 2.0,
-    34: 2.0,
-    35: 2.0,
-    36: 2.0,
-    37: 2.0,
-    38: 2.0,
-    39: 2.0,
-    40: 2.0,
-    41: 2.0,
+    12: 6.0,
+    13: 6.0,
+    14: 6.0,
+    15: 6.0,
+    16: 6.0,
+    17: 6.0,
+    18: 6.0,
+    19: 6.0,
+    20: 6.0,
+    21: 6.0,
+    22: 6.0,
+    23: 6.0,
+    24: 6.0,
+    25: 6.0,
+    26: 6.0,
+    27: 6.0,
+    28: 6.0,
+    29: 6.0,
+    30: 6.0,
+    31: 6.0,
+    32: 6.0,
+    33: 6.0,
+    34: 6.0,
+    35: 6.0,
+    36: 6.0,
+    37: 6.0,
+    
+    38: 4.0,
+    39: 4.0,
+    40: 3.0,
+    41: 3.0,
     42: 2.0,
     43: 2.0,
-    44: 2.0,
-    45: 2.0,
-    46: 2.0,
-    47: 2.0,
-    48: 2.0,
-    49: 2.0,
-    50: 2.0,
-    51: 2.0,
-    52: 2.0,
-    53: 2.0,
+
+    44: 1.0,
+    45: 1.0,
+    46: 1.0,
+    47: 1.0,
+
+    48: 1.0,
+    49: 1.0,
+    50: 1.0,
+    51: 1.0,
+    52: 1.0,
+    53: 1.0,
 }
 
 
@@ -463,6 +478,41 @@ def adjust_p_with_net_win(
         p0 = 0.5
     p_new = (1.0 - s) * p0 + s * p_target
     return _clamp(p_new, 0.0, 1.0)
+
+
+def adjust_p_with_net_win_new(net_win: float, *, c: float = 0.08167) -> float:
+    """统一新策略：仅根据 net_win 计算使用 oracle 的概率 p。
+
+    规则：
+    - 基线为 0.5；不分 pcs 阶段，不用旧的分桶表。
+    - 取 a = |net_win|，计算 k0 = log2(a)。若 k0 < 0，强制置 0。
+    - 根据 net_win 的符号恢复符号：net_win>0 → k = +k0；net_win<0 → k = -k0；net_win==0 → k = 0。
+    - 常数 c=0.08167，最终概率 p = 0.5 - k * c。
+    - 返回值夹到 [0,1]。
+    """
+    try:
+        a = abs(float(net_win))
+    except Exception:
+        a = 0.0
+
+    # 处理 a=0 的对数与负对数归零
+    if a <= 0.0:
+        k0 = 0.0
+    else:
+        k0 = math.log(a, 2.0)
+        if k0 < 0.0:
+            k0 = 0.0
+
+    # 恢复符号到 [-6,6]（log2(64)=6 的自然上界，不强制截断）
+    if net_win > 0.0:
+        k = +k0
+    elif net_win < 0.0:
+        k = -k0
+    else:
+        k = 0.0
+
+    p = 0.5 - (k * float(c))
+    return _clamp(p, 0.0, 1.0)
 
 
 # ------------------------------
@@ -908,9 +958,8 @@ def collect_game_12_to_53(
             writer.append_position(rec)
             steps_written += 1
 
-        # 决策：当步 p = adjust_p_with_net_win(p_for_pcs(pcs), net_win)
-        p0 = p_for_pcs(pcs)
-        p_adj = adjust_p_with_net_win(p0, net_win if net_win is not None else 0.0)
+        # 决策：使用新策略，仅依赖 net_win 计算 p
+        p_adj = adjust_p_with_net_win_new(net_win if net_win is not None else 0.0)
         use_oracle = sys_rng.random() < p_adj
 
         # 产生并点击落子

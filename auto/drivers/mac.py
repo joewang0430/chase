@@ -651,8 +651,9 @@ def _ocr_cell_value(img_pil: "Image.Image", cell_rect: Tuple[int,int,int,int],
 
 def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None) -> Tuple[List[str], float]:
     """
-    先用掩码定位“黄色最多的格”（最多取前3个），再对这些格的原图做 OCR。
-    若 OCR 全部失败，则以“面积最大”的格为 best_move，net_win=0.0（fallback）。
+    用掩码定位黄色格并对其做 OCR。
+    返回：读取成功的全部坐标列表（按 OCR 值降序），以及 net_win=读取到的最大值。
+    若 OCR 全部失败，则返回面积最大的一个坐标，net_win=0.0（fallback）。
     """
     import numpy as np
     import cv2
@@ -672,16 +673,13 @@ def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None)
             results.append((coord, float(val), rect))
 
     if results:
-        # 合并同格（理论上 candidates 已唯一）
+        # 全部成功读取的格按 OCR 值降序返回，net_win 为最大值
         results.sort(key=lambda t: t[1], reverse=True)
-        best_val = results[0][1]
-        tied = [r for r in results if abs(r[1] - best_val) <= 0.1 + 1e-9]
-        tied.sort(key=lambda t: t[0])  # 字典序
-        best_move = tied[0][0]
-        net_win = float(best_val)
+        moves = [t[0] for t in results]
+        net_win = float(results[0][1])
     else:
         # 3) 兜底：OCR 全失败 → 选择黄色面积最大的格，net_win=0.0
-        best_move = candidates[0][0]
+        moves = [candidates[0][0]]
         net_win = 0.0
         if debug_dir:
             with open(os.path.join(debug_dir, "fallback.txt"), "w", encoding="utf-8") as f:
@@ -701,7 +699,7 @@ def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None)
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.imwrite(base + "_vis.png", vis)
 
-    return [best_move], net_win
+    return moves, net_win
     
 # ---------------------------------------- Mac Driver
 

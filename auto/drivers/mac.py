@@ -653,7 +653,7 @@ def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None)
     """
     用掩码定位黄色格并对其做 OCR。
     返回：读取成功的全部坐标列表（按 OCR 值降序），以及 net_win=读取到的最大值。
-    若 OCR 全部失败，则返回面积最大的一个坐标，net_win=0.0（fallback）。
+    若 OCR 全部失败：直接抛出 RuntimeError("ocr_read_failed")，让上层终止当前盘并不写缓存。
     """
     import numpy as np
     import cv2
@@ -678,12 +678,14 @@ def _analyze_board_best(img_pil: "Image.Image", debug_dir: Optional[str] = None)
         moves = [t[0] for t in results]
         net_win = float(results[0][1])
     else:
-        # 3) 兜底：OCR 全失败 → 选择黄色面积最大的格，net_win=0.0
-        moves = [candidates[0][0]]
-        net_win = 0.0
+        # 3) OCR 全失败：抛出错误让上层终止当前盘（不写缓存、不重启软件）
         if debug_dir:
-            with open(os.path.join(debug_dir, "fallback.txt"), "w", encoding="utf-8") as f:
-                f.write("fallback:no-ocr; choose max-area cell\n")
+            try:
+                with open(os.path.join(debug_dir, "ocr_read_failed.txt"), "w", encoding="utf-8") as f:
+                    f.write("no-ocr: all candidates failed to parse numeric value\n")
+            except Exception:
+                pass
+        raise RuntimeError("ocr_read_failed")
 
     # 4) 调试可视化
     if debug_dir:

@@ -678,8 +678,35 @@ def opening_moves_7_to_8(
         use_oracle = sys_rng.random() < 0.75
         if use_oracle:
             # 直接读取（等待 engine_time 秒），取 top-1 最佳黄格。
-            best_moves, net_win = drv.wait_and_read()
-            if not isinstance(best_moves, list) or len(best_moves) == 0:
+            best_moves: List[str] = []
+            net_win: Optional[float] = None
+            recover_attempts = 0
+            while True:
+                try:
+                    bm, nw = drv.wait_and_read()
+                    best_moves = [str(m) for m in bm] if isinstance(bm, list) else []
+                    net_win = float(nw) if nw is not None else None
+                    break
+                except Exception as e:
+                    print(f"[CRASH][opening 7-8] wait_and_read error: {e}")
+                    if recover_attempts >= 1:
+                        print("[FATAL] Early-stage recovery failed twice; terminating.")
+                        raise
+                    print("[RECOVER] Sleeping and attempting Sensei recovery…")
+                    ok = False
+                    try:
+                        ok = hasattr(drv, "recover_after_crash") and drv.recover_after_crash()
+                    except Exception as e2:
+                        print(f"[RECOVER] recover_after_crash raised: {e2}")
+                    if ok:
+                        print("[RECOVERED] Early-stage read. Discard current game and signal restart.")
+                        raise RuntimeError("discard_current_game_after_recovery:opening_read")
+                    else:
+                        recover_attempts += 1
+                        time.sleep(0.8)
+                        continue
+
+            if not best_moves:
                 raise RuntimeError(f"oracle returned empty best_moves: {best_moves}")
             mv = str(best_moves[0])  # 只取第一名（不在候选间随机）
             pos = _mv_to_idx(mv)
@@ -689,10 +716,29 @@ def opening_moves_7_to_8(
             if pos < 0 or pos > 63 or not (legal & (1 << pos)):
                 raise RuntimeError(f"oracle proposed illegal move {mv} (pos={pos}) at side={side}")
             # 点击以保持 UI 同步
-            try:
-                drv.click_move(mv)
-            except Exception as e:
-                raise RuntimeError(f"driver click_move failed for {mv}: {e}")
+            recover_attempts = 0
+            while True:
+                try:
+                    drv.click_move(mv)
+                    break
+                except Exception as e:
+                    print(f"[CRASH][opening 7-8] click_move error: {e}")
+                    if recover_attempts >= 1:
+                        print("[FATAL] Early-stage recovery failed twice during click; terminating.")
+                        raise
+                    print("[RECOVER] Sleeping and attempting Sensei recovery…")
+                    ok = False
+                    try:
+                        ok = hasattr(drv, "recover_after_crash") and drv.recover_after_crash()
+                    except Exception as e2:
+                        print(f"[RECOVER] recover_after_crash raised: {e2}")
+                    if ok:
+                        print("[RECOVERED] Early-stage click. Discard current game and signal restart.")
+                        raise RuntimeError("discard_current_game_after_recovery:opening_click")
+                    else:
+                        recover_attempts += 1
+                        time.sleep(0.8)
+                        continue
             src = "oracle"
             logs.append({"src": src, "mv": mv, "net_win": float(net_win) if net_win is not None else None})
         else:
@@ -703,10 +749,29 @@ def opening_moves_7_to_8(
                 raise RuntimeError(f"C sampler returned invalid move: {pos}")
             mv = _idx_to_mv(pos)
             # 点击以保持 UI 同步（不等待分析）
-            try:
-                drv.click_move(mv)
-            except Exception as e:
-                raise RuntimeError(f"driver click_move failed for {mv}: {e}")
+            recover_attempts = 0
+            while True:
+                try:
+                    drv.click_move(mv)
+                    break
+                except Exception as e:
+                    print(f"[CRASH][opening 7-8] click_move error: {e}")
+                    if recover_attempts >= 1:
+                        print("[FATAL] Early-stage recovery failed twice during click; terminating.")
+                        raise
+                    print("[RECOVER] Sleeping and attempting Sensei recovery…")
+                    ok = False
+                    try:
+                        ok = hasattr(drv, "recover_after_crash") and drv.recover_after_crash()
+                    except Exception as e2:
+                        print(f"[RECOVER] recover_after_crash raised: {e2}")
+                    if ok:
+                        print("[RECOVERED] Early-stage click. Discard current game and signal restart.")
+                        raise RuntimeError("discard_current_game_after_recovery:opening_noise_click")
+                    else:
+                        recover_attempts += 1
+                        time.sleep(0.8)
+                        continue
             src = "noise"
             logs.append({"src": src, "mv": mv})
 
@@ -859,16 +924,23 @@ def collect_game_12_to_53(
     except Exception as e:
         raise RuntimeError(f"failed to sync UI to opening 1–6: {e}")
 
-    m7_8, black, white, side, logs78 = opening_moves_7_to_8(
-        moves_so_far=moves,
-        black_bb=black,
-        white_bb=white,
-        side_to_move=side,
-        driver_name=driver_name,
-        mock=mock,
-        rng=rng,
-    )
-    moves.extend(m7_8)
+    try:
+        m7_8, black, white, side, logs78 = opening_moves_7_to_8(
+            moves_so_far=moves,
+            black_bb=black,
+            white_bb=white,
+            side_to_move=side,
+            driver_name=driver_name,
+            mock=mock,
+            rng=rng,
+        )
+        moves.extend(m7_8)
+    except RuntimeError as e:
+        # 若开局 7-8 阶段触发恢复并请求丢弃当前盘，直接返回 discarded
+        if str(e).startswith("discard_current_game_after_recovery"):
+            print("[RECOVERED] opening stage. discard current game and begin next.")
+            return {"game_id": f"g_{_shortid(8)}", "moves": moves, "steps_written": 0, "oracle": 0, "noise": 0, "pass": 0, "discarded": True}
+        raise
 
     # 3) 准备 midgame driver（不 reset，不 replay；只用于 OCR 与点击）
     drv = create_driver(engine_time=2.0, driver=driver_name, mock=mock)
@@ -876,6 +948,12 @@ def collect_game_12_to_53(
         drv.ensure_running()
     except Exception as e:
         raise RuntimeError(f"driver ensure_running failed: {e}")
+
+    # 防御性校验：进入中盘前必须达到 pcs>=12；否则丢弃并重启新盘。
+    pcs_init = compute_pcs(black, white)
+    if pcs_init < 12:
+        print(f"[WARN] pcs={pcs_init} < 12 before midgame OCR; discarding current game to keep flow consistent.")
+        return {"game_id": game_id or f"g_{_shortid(8)}", "moves": moves, "steps_written": 0, "oracle": 0, "noise": 0, "pass": 0, "discarded": True}
 
     gid = game_id or f"g_{_shortid(8)}"
     steps_written = 0
@@ -911,7 +989,7 @@ def collect_game_12_to_53(
         et = engine_time_for_pcs(pcs)
         drv.engine_time = float(et)
 
-        # OCR 读取（容错：失败重试一次）
+        # OCR 读取（容错：失败重试一次；崩溃触发统一恢复）
         best_moves: List[str] = []
         net_win: Optional[float] = None
         for _try in range(2):
@@ -921,9 +999,26 @@ def collect_game_12_to_53(
                     best_moves = [str(m) for m in bm]
                 net_win = float(nw) if nw is not None else None
                 break
-            except Exception:
+            except Exception as e:
                 best_moves = []
                 net_win = None
+                if _try == 1:
+                    print(f"[CRASH] wait_and_read failed: {e}. attempting recovery...")
+                    ok = False
+                    for _r in range(2):  # one attempt + one retry
+                        try:
+                            if hasattr(drv, "recover_after_crash") and drv.recover_after_crash():
+                                ok = True
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(0.8)
+                    if not ok:
+                        print("[FATAL] recovery failed twice on read. ending script.")
+                        raise SystemExit(1)
+                    # 成功恢复：丢弃当前盘并返回，让上层多盘循环继续下一盘
+                    print("[RECOVERED] read stage. discard current game and begin next.")
+                    return {"game_id": gid, "moves": moves, "steps_written": 0, "oracle": 0, "noise": 0, "pass": pass_moves, "discarded": True}
 
         # 记录本步（若在采集区间且非 PASS）
         me, opp = _black_white_to_my_opp(black, white, side)
@@ -997,12 +1092,26 @@ def collect_game_12_to_53(
                 pos = (lsb.bit_length() - 1)
                 mv = _idx_to_mv(pos)
 
-        # 点击（保持 UI 同步）
+        # 点击（保持 UI 同步；崩溃触发统一恢复）
         try:
             assert mv is not None and pos is not None
             drv.click_move(mv)
         except Exception as e:
-            raise RuntimeError(f"driver click_move failed for {mv}: {e}")
+            print(f"[CRASH] click_move failed for {mv}: {e}. attempting recovery...")
+            ok2 = False
+            for _r in range(2):
+                try:
+                    if hasattr(drv, "recover_after_crash") and drv.recover_after_crash():
+                        ok2 = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.8)
+            if not ok2:
+                print("[FATAL] recovery failed twice on click. ending script.")
+                raise SystemExit(1)
+            print("[RECOVERED] click stage. discard current game and begin next.")
+            return {"game_id": gid, "moves": moves, "steps_written": 0, "oracle": 0, "noise": 0, "pass": pass_moves, "discarded": True}
 
         # 应用到位板
         assert pos is not None
@@ -1130,17 +1239,21 @@ def main(argv: Optional[list[str]] = None) -> None:
                     rng=rng,
                     params=DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random)),
                 )
-                done_games += 1
-                i += 1
+                # 若本盘被丢弃（崩溃后自动恢复并跳过），不计入完成数与 i；立即尝试开启下一盘
+                if not summary.get('discarded'):
+                    done_games += 1
+                    i += 1
 
                 print(
-                    f"[COLLECT] game#{i}: steps={summary.get('steps_written')} "
+                    f"[COLLECT] game#{i if not summary.get('discarded') else '(discarded)'}: steps={summary.get('steps_written')} "
                     f"oracle={summary.get('oracle')} noise={summary.get('noise')} pass={summary.get('pass')}"
                 )
-                total_steps += int(summary.get('steps_written') or 0)
-                total_oracle += int(summary.get('oracle') or 0)
-                total_noise += int(summary.get('noise') or 0)
-                total_pass += int(summary.get('pass') or 0)
+                # 统计只累计未丢弃的盘
+                if not summary.get('discarded'):
+                    total_steps += int(summary.get('steps_written') or 0)
+                    total_oracle += int(summary.get('oracle') or 0)
+                    total_noise += int(summary.get('noise') or 0)
+                    total_pass += int(summary.get('pass') or 0)
 
                 # 若设置了时间预算，且完成这一盘后已越过截止时间，则到此为止（满足“超过限时的第一盘结束后停止”）
                 if deadline is not None and time.time() >= deadline:

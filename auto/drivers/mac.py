@@ -942,3 +942,105 @@ class MacDriver(SoftwareDriverBase):
         img = _screenshot_board()
         best_moves, net_win = _analyze_board_best(img, debug_dir=None)
         return best_moves, net_win
+
+    def probe_calibrate_ignore(self) -> str:
+        """标定崩溃提示框的“忽略”按钮绝对屏幕坐标。
+
+        引导你把鼠标移到“忽略”按钮上并按回车，记录到 calib：{"ignore_abs": [x,y]}。
+        """
+        import pyautogui
+        pyautogui.FAILSAFE = False
+        print("[CAL] 请在崩溃提示出现时，把鼠标移动到‘忽略’按钮上，按回车确认...")
+        input()
+        p = pyautogui.position()
+        data = _save_calib_merged({"ignore_abs": [int(p.x), int(p.y)]})
+        print(f"[CAL] saved to {CALIB_PATH}: ignore_abs={data['ignore_abs']}")
+        return CALIB_PATH
+
+    def click_ignore_crash_dialog(self, delay_after_click: float = 0.5) -> bool:
+        """使用标定的绝对坐标点击一次‘忽略’按钮。返回 True 表示已尝试点击。"""
+        import pyautogui
+        pyautogui.FAILSAFE = False
+        cfg = _load_calib()
+        pt = cfg.get("ignore_abs")
+        if not (isinstance(pt, list) and len(pt) == 2):
+            print(f"[WARN] ignore_abs not calibrated in {CALIB_PATH}")
+            return False
+        x, y = int(pt[0]), int(pt[1])
+        pyautogui.click(x, y)
+        time.sleep(float(delay_after_click))
+        return True
+
+    def close_crash_dialog(self, labels: Optional[set] = None) -> bool:
+        """Dismiss macOS crash dialogs via AX buttons; returns True if clicked."""
+        labels = labels or {"重新打开","Reopen","忽略","OK","确定","是"}
+        # Try System Events on any AXDialog or sheet buttons with known labels
+        osa = (
+            'tell application "System Events"\n'
+            '  set acted to false\n'
+            '  repeat with p in (every process)\n'
+            '    try\n'
+            '      repeat with w in windows of p\n'
+            '        try\n'
+            '          if exists w then\n'
+            '            -- AXDialog\n'
+            '            if (exists (window 1 of p whose subrole is "AXDialog")) then\n'
+            '              set dlg to (window 1 of p whose subrole is "AXDialog")\n'
+            '              repeat with t in {LABELS}\n'
+            '                try\n'
+            '                  if exists button (t as string) of dlg then\n'
+            '                    click button (t as string) of dlg\n'
+            '                    return true\n'
+            '                  end if\n'
+            '                end try\n'
+            '              end repeat\n'
+            '            end if\n'
+            '            -- sheet on front window\n'
+            '            if exists sheet 1 of w then\n'
+            '              set s to sheet 1 of w\n'
+            '              repeat with t in {LABELS}\n'
+            '                try\n'
+            '                  if exists button (t as string) of s then\n'
+            '                    click button (t as string) of s\n'
+            '                    return true\n'
+            '                  end if\n'
+            '                end try\n'
+            '              end repeat\n'
+            '            end if\n'
+            '          end if\n'
+            '        end try\n'
+            '      end repeat\n'
+            '    end try\n'
+            '  end repeat\n'
+            '  return false\n'
+            'end tell'
+        )
+        lbl_list = ",".join([f'"{x}"' for x in labels])
+        try:
+            out = _run_osa(osa.replace("{LABELS}", "{" + lbl_list + "}"))
+            return out.lower() == "true"
+        except Exception:
+            return False
+
+    def recover_after_crash(self) -> bool:
+        """统一恢复（鼠标版）：sleep(60s) → 点击‘忽略’ → 重新打开 → ensure → reset → probe。"""
+        try:
+            time.sleep(60.0)
+            try:
+                self.click_ignore_crash_dialog()
+            except Exception:
+                pass
+            subprocess.run(["open", "-a", APP_NAME], check=False)
+            time.sleep(1.2)
+            self.ensure_running()
+            try:
+                self.reset_board()
+            except Exception:
+                pass
+            try:
+                _get_window_bounds(APP_NAME)
+                return True
+            except Exception:
+                return False
+        except Exception:
+            return False

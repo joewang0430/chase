@@ -32,16 +32,17 @@ Human notes (why this file exists):
 """
 
 # 测试单个棋谱：
-# python3 auto/generate_dataset.py --collect-one --driver mac --no-compress
-
-# 在 600 秒内尽量多采（但每盘会完整结束） 上限是600秒，因为 --games 很大：
-# python3 auto/generate_dataset.py --collect-one --driver mac --time-budget 300 --games 9999 --no-compress
+# python3 auto/generate_dataset.py --collect-one --driver mac --games 3 --logic auto --no-compress
 
 # 采 10 局，不压缩：
-# python3 auto/generate_dataset.py --collect-one --driver mac --games 10 --no-compress
+# python3 auto/generate_dataset.py --collect-one --driver mac --games 10 --logic auto --no-compress
 
 # 7 小时
-# python3 auto/generate_dataset.py --collect-one --driver mac --time-budget 25200 --games 9999 --no-compress
+# python3 auto/generate_dataset.py --collect-one --driver mac --time-budget 25200 --games 9999 --logic auto --no-compress
+
+# 无限 (够跑31年)
+# python3 auto/generate_dataset.py --collect-one --driver mac --time-budget 999999999 --games 999999999 --logic auto --no-compress
+
 
 # 上面的的命令行例子都不 compress
 
@@ -171,6 +172,70 @@ def engine_time_for_pcs(pcs: int, schedule: Optional[Dict[int, float]] = None, d
         return float(m.get(int(pcs), float(default)))
     except Exception:
         return float(default)
+
+
+# ------------------------------
+# 落子逻辑模式与区域判定辅助（Logic A: 现有；Logic B: 约束规则）
+
+def _idx_to_row_col(idx: int) -> Tuple[int, int]:
+    r = int(idx) // 8
+    c = int(idx) % 8
+    return r, c
+
+def _is_c_square(idx: int) -> bool:
+    """四角各 2×2 的 C-squares（共 16 格）。"""
+    r, c = _idx_to_row_col(int(idx))
+    return (
+        (r < 2 and c < 2) or  # 左上角 2x2
+        (r < 2 and c > 5) or  # 右上角 2x2
+        (r > 5 and c < 2) or  # 左下角 2x2
+        (r > 5 and c > 5)     # 右下角 2x2
+    )
+
+def _is_edge(idx: int) -> bool:
+    """最外圈一层（包含角）。"""
+    r, c = _idx_to_row_col(int(idx))
+    return (r == 0 or r == 7 or c == 0 or c == 7)
+
+def _is_edge_only(idx: int) -> bool:
+    """外圈但不包含四角 2×2 的角格。用于“优先 edge，再 C”的回退层级。"""
+    return _is_edge(idx) and (not _is_c_square(idx))
+
+def _bitmask_to_indices(bb: int) -> List[int]:
+    return [i for i in range(64) if (int(bb) & (1 << i))]
+
+def _filter_non_edge_non_c(moves: List[int]) -> List[int]:
+    return [m for m in moves if (not _is_edge(m)) and (not _is_c_square(m))]
+
+def _filter_edge_only(moves: List[int]) -> List[int]:
+    return [m for m in moves if _is_edge_only(m)]
+
+def _filter_c_squares(moves: List[int]) -> List[int]:
+    return [m for m in moves if _is_c_square(m)]
+
+def _pick_uniform(sys_rng: random.SystemRandom, moves: List[int]) -> Optional[int]:
+    if not moves:
+        return None
+    return sys_rng.choice(moves)
+
+def _choose_move_logic_b(legal_bb: int, pcs: int, *, sys_rng: random.SystemRandom) -> Optional[int]:
+    """按逻辑B选择一个落子索引：
+    - 噪声/替代共用：优先非 edge 非 C；若空→优先 edge-only；若仍空→C-squares。
+    - pcs<22 时也沿用同样的过滤（两者都禁 edge/C；只有在非边集为空时才破例选 edge，再不行选 C）。
+    """
+    legal = _bitmask_to_indices(int(legal_bb))
+    if not legal:
+        return None
+    non_region = _filter_non_edge_non_c(legal)
+    if non_region:
+        return _pick_uniform(sys_rng, non_region)
+    edge_only = _filter_edge_only(legal)
+    if edge_only:
+        return _pick_uniform(sys_rng, edge_only)
+    c_only = _filter_c_squares(legal)
+    if c_only:
+        return _pick_uniform(sys_rng, c_only)
+    return None
 
 
 # ------------------------------
@@ -571,7 +636,7 @@ def _has_legal(black: int, white: int, side: str) -> bool:
     me, opp = _black_white_to_my_opp(black, white, side)
     return _legal_moves(me, opp) != 0
 
-def opening_moves_1_to_6(*, rng: Optional[random.Random] = None) -> Tuple[List[str], int, int, str]:
+def opening_moves_1_to_6(*, rng: Optional[random.Random] = None, logic_mode: Optional[str] = None) -> Tuple[List[str], int, int, str]:
     """生成开局前 1-6 手，不用 OCR：
     - 第 1 手黑：等概率随机 d3/c4/e6/f5；
     - 第 2 手白：按首手显式表的 0.55/0.35/0.10 分布；
@@ -608,7 +673,7 @@ def opening_moves_1_to_6(*, rng: Optional[random.Random] = None) -> Tuple[List[s
     black, white, side = _apply_on_bw(black, white, side, idx2)
     moves.append(mv2)
 
-    # 第 3-6 手：C 抽样（处理 PASS：不计数，切换走子）
+    # 第 3-6 手：按模式选择（A: C 抽样；B: 约束 + 均匀随机），处理 PASS：不计数，切换走子
     while len(moves) < 6:
         if not _has_legal(black, white, side):
             # PASS：切换一手；若连续 PASS（理论上不会发生在前 8 手），直接 break 防御
@@ -618,9 +683,17 @@ def opening_moves_1_to_6(*, rng: Optional[random.Random] = None) -> Tuple[List[s
             # 不计数，继续
             continue
         me, opp = _black_white_to_my_opp(black, white, side)
-        pos = sampler.choose_move(me, opp)
-        if pos < 0 or pos > 63:
-            raise RuntimeError(f"C sampler returned invalid move: {pos}")
+        legal_bb = _legal_moves(me, opp)
+        # 逻辑模式：B → 均匀随机 + 约束；A → 保留 C 抽样
+        pcs_now = compute_pcs(black, white)
+        if (logic_mode or "A").upper() == "B":
+            pos = _choose_move_logic_b(legal_bb, pcs_now, sys_rng=random.SystemRandom())
+            if pos is None:
+                pos = sampler.choose_move(me, opp)
+        else:
+            pos = sampler.choose_move(me, opp)
+        if pos < 0 or pos > 63 or not (legal_bb & (1 << pos)):
+            raise RuntimeError(f"early move invalid or illegal: {pos}")
         mv = _idx_to_mv(pos)
         black, white, side = _apply_on_bw(black, white, side, pos)
         moves.append(mv)
@@ -637,6 +710,7 @@ def opening_moves_7_to_8(
     driver_name: Optional[str] = None,
     mock: bool = False,
     rng: Optional[random.Random] = None,
+    logic_mode: Optional[str] = None,
 ) -> Tuple[List[str], int, int, str, List[Dict[str, Any]]]:
     """推进第 7-8 手：每手 50% C 噪声，50% oracle（OCR 最佳点取 top-1）。
 
@@ -715,6 +789,14 @@ def opening_moves_7_to_8(
             legal = _legal_moves(me_chk, opp_chk)
             if pos < 0 or pos > 63 or not (legal & (1 << pos)):
                 raise RuntimeError(f"oracle proposed illegal move {mv} (pos={pos}) at side={side}")
+            # 逻辑B：在 pcs<22 时，若 oracle 命中 edge 或 C，改为噪声式替代
+            pcs_now = compute_pcs(black, white)
+            if (logic_mode or "A").upper() == "B":
+                if pcs_now < 22 and (_is_edge(pos) or _is_c_square(pos)):
+                    pos_alt = _choose_move_logic_b(legal, pcs_now, sys_rng=sys_rng)
+                    if pos_alt is not None:
+                        pos = pos_alt
+                        mv = _idx_to_mv(pos)
             # 点击以保持 UI 同步
             recover_attempts = 0
             while True:
@@ -744,9 +826,16 @@ def opening_moves_7_to_8(
         else:
             # C 噪声
             me, opp = _black_white_to_my_opp(black, white, side)
-            pos = sampler.choose_move(me, opp)
-            if pos < 0 or pos > 63:
-                raise RuntimeError(f"C sampler returned invalid move: {pos}")
+            legal = _legal_moves(me, opp)
+            pcs_now = compute_pcs(black, white)
+            # 逻辑B：噪声完全均匀随机 + 约束；否则保留 C 抽样
+            if (logic_mode or "A").upper() == "B":
+                pos_b = _choose_move_logic_b(legal, pcs_now, sys_rng=sys_rng)
+                pos = pos_b if pos_b is not None else sampler.choose_move(me, opp)
+            else:
+                pos = sampler.choose_move(me, opp)
+            if pos < 0 or pos > 63 or not (legal & (1 << pos)):
+                raise RuntimeError(f"noise move invalid or illegal: {pos}")
             mv = _idx_to_mv(pos)
             # 点击以保持 UI 同步（不等待分析）
             recover_attempts = 0
@@ -882,6 +971,7 @@ def collect_game_12_to_53(
     rng: Optional[random.Random] = None,
     params: Optional[DatasetParams] = None,
     game_id: Optional[str] = None,
+    logic_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """从开局推进到 53pcs，按每手 OCR 记录并选择 oracle/noise 点击落子。
 
@@ -907,7 +997,7 @@ def collect_game_12_to_53(
 
     # 1) 开局 1-6（本地）
     moves: List[str] = []
-    m1_6, black, white, side = opening_moves_1_to_6(rng=rng)
+    m1_6, black, white, side = opening_moves_1_to_6(rng=rng, logic_mode=logic_mode)
     moves.extend(m1_6)
 
     # 2) 第 7-8 手（保证 UI 同步：内部 ensure + wait_and_read/click）
@@ -933,6 +1023,7 @@ def collect_game_12_to_53(
             driver_name=driver_name,
             mock=mock,
             rng=rng,
+            logic_mode=logic_mode,
         )
         moves.extend(m7_8)
     except RuntimeError as e:
@@ -1072,25 +1163,54 @@ def collect_game_12_to_53(
                 raise RuntimeError(
                     f"OCR top-1 illegal: mv={mv} pos={pos} side={side} pcs={pcs} legal_count={legal_cnt}"
                 )
+            # 逻辑B：pcs<22 时，oracle 命中 edge 或 C → 改用约束随机替代
+            if (logic_mode or "A").upper() == "B":
+                if pcs < 22 and (_is_edge(pos) or _is_c_square(pos)):
+                    pos_alt = _choose_move_logic_b(legal_bb, pcs, sys_rng=sys_rng)
+                    if pos_alt is not None:
+                        pos = pos_alt
+                        mv = _idx_to_mv(pos)
 
         if not use_oracle:
-            # 噪声：采样一个合法点
-            me2, opp2 = me, opp
-            for _ in range(3):  # 最多尝试 3 次
-                cand = sampler.choose_move(me2, opp2)
-                if 0 <= cand <= 63 and (legal_bb & (1 << cand)):
-                    pos = cand
+            # 噪声：逻辑B 使用均匀随机 + 约束；逻辑A 保留 C 抽样（此处通过回退实现）
+            if (logic_mode or "A").upper() == "B":
+                pos_b = _choose_move_logic_b(legal_bb, pcs, sys_rng=sys_rng)
+                if pos_b is not None:
+                    pos = pos_b
                     mv = _idx_to_mv(pos)
-                    break
-            if mv is None or pos is None:
-                # 兜底：取最低位合法点
-                if legal_bb == 0:
-                    # 理论上不会发生（上面已检查 has_legal）
-                    side = 'W' if side == 'B' else 'B'
-                    continue
-                lsb = (legal_bb & -legal_bb)
-                pos = (lsb.bit_length() - 1)
-                mv = _idx_to_mv(pos)
+                else:
+                    # 回退到 C 抽样（保持旧行为）
+                    me2, opp2 = me, opp
+                    for _ in range(3):  # 最多尝试 3 次
+                        cand = sampler.choose_move(me2, opp2)
+                        if 0 <= cand <= 63 and (legal_bb & (1 << cand)):
+                            pos = cand
+                            mv = _idx_to_mv(pos)
+                            break
+                    if mv is None or pos is None:
+                        # 兜底：取最低位合法点
+                        if legal_bb == 0:
+                            side = 'W' if side == 'B' else 'B'
+                            continue
+                        lsb = (legal_bb & -legal_bb)
+                        pos = (lsb.bit_length() - 1)
+                        mv = _idx_to_mv(pos)
+            else:
+                # 逻辑A：按旧行为
+                me2, opp2 = me, opp
+                for _ in range(3):
+                    cand = sampler.choose_move(me2, opp2)
+                    if 0 <= cand <= 63 and (legal_bb & (1 << cand)):
+                        pos = cand
+                        mv = _idx_to_mv(pos)
+                        break
+                if mv is None or pos is None:
+                    if legal_bb == 0:
+                        side = 'W' if side == 'B' else 'B'
+                        continue
+                    lsb = (legal_bb & -legal_bb)
+                    pos = (lsb.bit_length() - 1)
+                    mv = _idx_to_mv(pos)
 
         # 点击（保持 UI 同步；崩溃触发统一恢复）
         try:
@@ -1139,6 +1259,7 @@ def collect_game_12_to_53(
         "oracle": oracle_moves,
         "noise": noise_moves,
         "pass": pass_moves,
+        "logic_mode": (logic_mode or "A").upper(),
     }
 
 
@@ -1179,6 +1300,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--time-budget", type=float, default=None, help="seconds budget for multi-game collection; finish the current game after crossing the deadline, then stop")
     ap.add_argument("--driver", type=str, default=None, help="driver name, e.g., mac/mock/windows/linux")
     ap.add_argument("--mock", action="store_true", help="use mock driver (no UI)")
+    ap.add_argument("--logic", type=str, choices=["A","B","auto"], default="auto", help="per-game logic: A=baseline, B=constrained, auto=random per game")
     # 提前占个位：后续会新增 --driver/--time-budget/--games 等参数
     return ap.parse_args(argv)
 
@@ -1202,6 +1324,18 @@ def main(argv: Optional[list[str]] = None) -> None:
     # 3) 把本次“关键运行参数”落在 meta.json，便于追溯
     params = DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random))
     update_meta_params(rp.meta_path, params)
+    # 记录本次运行的逻辑模式选择策略（A/B/auto）到 meta.json
+    try:
+        cur = {}
+        if os.path.exists(rp.meta_path):
+            with open(rp.meta_path, "r", encoding="utf-8") as f:
+                cur = json.load(f)
+        cur.setdefault("params", {})
+        cur["params"]["logic_run"] = str(getattr(args, "logic", "auto"))
+        with open(rp.meta_path, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] write logic_run to meta failed: {e}")
 
     # 4) 预留：后续加 --collect-one / --driver 等参数触发真实采集。
     if getattr(args, "collect_one", False):
@@ -1222,6 +1356,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             print(f"[COLLECT] start (up to {games_target} game(s)) …")
 
         i = 0
+        sys_rng = random.SystemRandom()
         try:
             while i < games_target:
                 # 若设了 time budget：只有在未到截止时才开始新的一盘
@@ -1232,12 +1367,16 @@ def main(argv: Optional[list[str]] = None) -> None:
                 rng = random.Random(int(base_seed) + i) if base_seed is not None else random.Random()
 
                 print(f"[COLLECT] game#{i+1} starting …")
+                # 选择本盘逻辑模式：CLI 指定则用指定；未指定则 50/50 随机
+                logic_run = str(getattr(args, "logic", "auto")).lower()
+                logic_mode_game = ("A" if logic_run == "a" else "B" if logic_run == "b" else ("A" if sys_rng.random() < 0.5 else "B"))
                 summary = collect_game_12_to_53(
                     writer=writer,
                     driver_name=getattr(args, "driver", None),
                     mock=bool(getattr(args, "mock", False)),
                     rng=rng,
                     params=DatasetParams(engine_time=float(args.engine_time), early_random_moves=int(args.early_random)),
+                    logic_mode=logic_mode_game,
                 )
                 # 若本盘被丢弃（崩溃后自动恢复并跳过），不计入完成数与 i；立即尝试开启下一盘
                 if not summary.get('discarded'):
@@ -1246,7 +1385,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
                 print(
                     f"[COLLECT] game#{i if not summary.get('discarded') else '(discarded)'}: steps={summary.get('steps_written')} "
-                    f"oracle={summary.get('oracle')} noise={summary.get('noise')} pass={summary.get('pass')}"
+                    f"oracle={summary.get('oracle')} noise={summary.get('noise')} pass={summary.get('pass')} logic={summary.get('logic_mode')}"
                 )
                 # 统计只累计未丢弃的盘
                 if not summary.get('discarded'):

@@ -31,8 +31,8 @@ Human notes (why this file exists):
     但会做最基本的 key/合法计数/stage 的占位（后续会在构造记录时计算）。
 """
 
-# 测试单个棋谱：
-# python3 auto/generate_dataset.py --collect-one --driver mac --games 3 --logic auto --no-compress
+# 测试单个棋谱,使用的是logicB：
+# python3 auto/generate_dataset.py --collect-one --driver mac --games 1 --logic B --no-compress
 
 # 采 10 局，不压缩：
 # python3 auto/generate_dataset.py --collect-one --driver mac --games 10 --logic auto --no-compress
@@ -175,6 +175,15 @@ def engine_time_for_pcs(pcs: int, schedule: Optional[Dict[int, float]] = None, d
 
 
 # ------------------------------
+# 全局阈值：Logic B 在早期阶段（pcs 小于该值）禁止 oracle 选择 Edge/C，改为噪声式替代
+# 便于后续统一调整（例如 20、24 等），避免散落的硬编码。
+LOGIC_B_FORBID_EDGE_C_UNTIL_PCS: int = 8 #12
+
+# auto 模式下每盘选择 Logic A 的概率（其余归 Logic B）。
+# 例如设为 0.20 → A:20% / B:80%
+LOGIC_AUTO_PROB_A: float = 0.20
+
+# ------------------------------
 # 落子逻辑模式与区域判定辅助（Logic A: 现有；Logic B: 约束规则）
 
 def _idx_to_row_col(idx: int) -> Tuple[int, int]:
@@ -221,7 +230,7 @@ def _pick_uniform(sys_rng: random.SystemRandom, moves: List[int]) -> Optional[in
 def _choose_move_logic_b(legal_bb: int, pcs: int, *, sys_rng: random.SystemRandom) -> Optional[int]:
     """按逻辑B选择一个落子索引：
     - 噪声/替代共用：优先非 edge 非 C；若空→优先 edge-only；若仍空→C-squares。
-    - pcs<22 时也沿用同样的过滤（两者都禁 edge/C；只有在非边集为空时才破例选 edge，再不行选 C）。
+    - pcs<LOGIC_B_FORBID_EDGE_C_UNTIL_PCS 时也沿用同样的过滤（两者都禁 edge/C；只有在非边集为空时才破例选 edge，再不行选 C）。
     """
     legal = _bitmask_to_indices(int(legal_bb))
     if not legal:
@@ -792,7 +801,7 @@ def opening_moves_7_to_8(
             # 逻辑B：在 pcs<22 时，若 oracle 命中 edge 或 C，改为噪声式替代
             pcs_now = compute_pcs(black, white)
             if (logic_mode or "A").upper() == "B":
-                if pcs_now < 22 and (_is_edge(pos) or _is_c_square(pos)):
+                if pcs_now < LOGIC_B_FORBID_EDGE_C_UNTIL_PCS and (_is_edge(pos) or _is_c_square(pos)):
                     pos_alt = _choose_move_logic_b(legal, pcs_now, sys_rng=sys_rng)
                     if pos_alt is not None:
                         pos = pos_alt
@@ -1367,9 +1376,13 @@ def main(argv: Optional[list[str]] = None) -> None:
                 rng = random.Random(int(base_seed) + i) if base_seed is not None else random.Random()
 
                 print(f"[COLLECT] game#{i+1} starting …")
-                # 选择本盘逻辑模式：CLI 指定则用指定；未指定则 50/50 随机
+                # 选择本盘逻辑模式：CLI 指定则用指定；未指定时 auto=A 概率 LOGIC_AUTO_PROB_A / B 概率 (1-LOGIC_AUTO_PROB_A)
                 logic_run = str(getattr(args, "logic", "auto")).lower()
-                logic_mode_game = ("A" if logic_run == "a" else "B" if logic_run == "b" else ("A" if sys_rng.random() < 0.5 else "B"))
+                logic_mode_game = (
+                    "A" if logic_run == "a" else
+                    "B" if logic_run == "b" else
+                    ("A" if sys_rng.random() < LOGIC_AUTO_PROB_A else "B")
+                )
                 summary = collect_game_12_to_53(
                     writer=writer,
                     driver_name=getattr(args, "driver", None),

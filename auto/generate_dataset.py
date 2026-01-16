@@ -1,3 +1,5 @@
+# python3 scripts/count_raw_games.py --root dataset/raw
+
 from __future__ import annotations
 
 import os
@@ -226,6 +228,20 @@ def _pick_uniform(sys_rng: random.SystemRandom, moves: List[int]) -> Optional[in
     if not moves:
         return None
     return sys_rng.choice(moves)
+
+
+def _choose_move_logic_a_noise_no_c(legal_bb: int, *, sys_rng: random.SystemRandom) -> Optional[int]:
+    """Mode A 的 noise 选点：禁止落在 C-squares。
+
+    规则：
+    - 优先从“合法且非 C-squares”的集合中等概率随机；
+    - 若该集合为空，则回退到任意合法点等概率随机。
+    """
+    legal = _bitmask_to_indices(int(legal_bb))
+    if not legal:
+        return None
+    non_c = [m for m in legal if not _is_c_square(m)]
+    return _pick_uniform(sys_rng, non_c if non_c else legal)
 
 def _choose_move_logic_b(legal_bb: int, pcs: int, *, sys_rng: random.SystemRandom) -> Optional[int]:
     """按逻辑B选择一个落子索引：
@@ -693,14 +709,15 @@ def opening_moves_1_to_6(*, rng: Optional[random.Random] = None, logic_mode: Opt
             continue
         me, opp = _black_white_to_my_opp(black, white, side)
         legal_bb = _legal_moves(me, opp)
-        # 逻辑模式：B → 均匀随机 + 约束；A → 保留 C 抽样
+        # 逻辑模式：B → 均匀随机 + 约束；A → noise 禁止落 C-squares
         pcs_now = compute_pcs(black, white)
         if (logic_mode or "A").upper() == "B":
             pos = _choose_move_logic_b(legal_bb, pcs_now, sys_rng=random.SystemRandom())
             if pos is None:
                 pos = sampler.choose_move(me, opp)
         else:
-            pos = sampler.choose_move(me, opp)
+            pos_a = _choose_move_logic_a_noise_no_c(legal_bb, sys_rng=random.SystemRandom())
+            pos = int(pos_a) if pos_a is not None else sampler.choose_move(me, opp)
         if pos < 0 or pos > 63 or not (legal_bb & (1 << pos)):
             raise RuntimeError(f"early move invalid or illegal: {pos}")
         mv = _idx_to_mv(pos)
@@ -842,7 +859,8 @@ def opening_moves_7_to_8(
                 pos_b = _choose_move_logic_b(legal, pcs_now, sys_rng=sys_rng)
                 pos = pos_b if pos_b is not None else sampler.choose_move(me, opp)
             else:
-                pos = sampler.choose_move(me, opp)
+                pos_a = _choose_move_logic_a_noise_no_c(legal, sys_rng=sys_rng)
+                pos = int(pos_a) if pos_a is not None else sampler.choose_move(me, opp)
             if pos < 0 or pos > 63 or not (legal & (1 << pos)):
                 raise RuntimeError(f"noise move invalid or illegal: {pos}")
             mv = _idx_to_mv(pos)
@@ -1205,21 +1223,27 @@ def collect_game_12_to_53(
                         pos = (lsb.bit_length() - 1)
                         mv = _idx_to_mv(pos)
             else:
-                # 逻辑A：按旧行为
-                me2, opp2 = me, opp
-                for _ in range(3):
-                    cand = sampler.choose_move(me2, opp2)
-                    if 0 <= cand <= 63 and (legal_bb & (1 << cand)):
-                        pos = cand
-                        mv = _idx_to_mv(pos)
-                        break
-                if mv is None or pos is None:
-                    if legal_bb == 0:
-                        side = 'W' if side == 'B' else 'B'
-                        continue
-                    lsb = (legal_bb & -legal_bb)
-                    pos = (lsb.bit_length() - 1)
+                # 逻辑A：noise 禁止落 C-squares
+                pos_a = _choose_move_logic_a_noise_no_c(legal_bb, sys_rng=sys_rng)
+                if pos_a is not None:
+                    pos = int(pos_a)
                     mv = _idx_to_mv(pos)
+                else:
+                    # 兜底：保持旧行为（理论上 legal_bb!=0 时 pos_a 不会是 None）
+                    me2, opp2 = me, opp
+                    for _ in range(3):
+                        cand = sampler.choose_move(me2, opp2)
+                        if 0 <= cand <= 63 and (legal_bb & (1 << cand)):
+                            pos = cand
+                            mv = _idx_to_mv(pos)
+                            break
+                    if mv is None or pos is None:
+                        if legal_bb == 0:
+                            side = 'W' if side == 'B' else 'B'
+                            continue
+                        lsb = (legal_bb & -legal_bb)
+                        pos = (lsb.bit_length() - 1)
+                        mv = _idx_to_mv(pos)
 
         # 点击（保持 UI 同步；崩溃触发统一恢复）
         try:

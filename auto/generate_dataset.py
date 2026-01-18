@@ -191,6 +191,10 @@ LOGIC_AUTO_PROB_A: float = 0.20
 # 以确保模型能学会处理边界情况。
 LOGIC_B_ENABLE_FIRST_EDGE_FORCE: bool = True
 
+# 在 Mode B 中，若 OCR 的最佳解落在 Edge 或 C 区域，
+# 仅在棋局前 28 颗子（含）强制采纳该 Oracle 解；超过则回归原有约束逻辑。
+LOGIC_B_FORCE_EDGE_C_UNTIL_PCS: int = 28
+
 # ------------------------------
 # 落子逻辑模式与区域判定辅助（Logic A: 现有；Logic B: 约束规则）
 
@@ -821,10 +825,14 @@ def opening_moves_7_to_8(
             legal = _legal_moves(me_chk, opp_chk)
             if pos < 0 or pos > 63 or not (legal & (1 << pos)):
                 raise RuntimeError(f"oracle proposed illegal move {mv} (pos={pos}) at side={side}")
-            # 逻辑B：在 pcs<22 时，若 oracle 命中 edge 或 C，改为噪声式替代
+            # 逻辑B：若 oracle 命中 edge/C 且 pcs<=28，则保留 oracle；
+            # 否则若 pcs<LOGIC_B_FORBID_EDGE_C_UNTIL_PCS 则改为约束随机替代。
             pcs_now = compute_pcs(black, white)
             if (logic_mode or "A").upper() == "B":
-                if pcs_now < LOGIC_B_FORBID_EDGE_C_UNTIL_PCS and (_is_edge(pos) or _is_c_square(pos)):
+                if (_is_edge(pos) or _is_c_square(pos)) and (pcs_now <= LOGIC_B_FORCE_EDGE_C_UNTIL_PCS):
+                    # keep oracle move as-is within early threshold
+                    pass
+                elif pcs_now < LOGIC_B_FORBID_EDGE_C_UNTIL_PCS and (_is_edge(pos) or _is_c_square(pos)):
                     pos_alt = _choose_move_logic_b(legal, pcs_now, sys_rng=sys_rng)
                     if pos_alt is not None:
                         pos = pos_alt
@@ -1086,9 +1094,6 @@ def collect_game_12_to_53(
     noise_moves = 0
     pass_moves = 0
 
-    # Logic B: 记录是否已触发过“首次强制 Edge”
-    first_edge_force_consumed: bool = False
-
     def _both_no_legal(b: int, w: int, s: str) -> bool:
         if not _has_legal(b, w, s):
             s2 = 'W' if s == 'B' else 'B'
@@ -1188,20 +1193,21 @@ def collect_game_12_to_53(
         p_adj = adjust_p_with_net_win_new(net_win if net_win is not None else 0.0)
         use_oracle = sys_rng.random() < p_adj
 
-        # [Logic B Feature] Ensure first Oracle Edge suggestion is taken
+        # [Logic B Feature] Force Oracle if it suggests Edge/C only when pcs<=28
+        # Beyond 28, keep prior logic (early override under LOGIC_B_FORBID_EDGE_C_UNTIL_PCS).
         is_mode_b = (logic_mode or "A").upper() == "B"
-        force_this_turn = False
-        
-        if is_mode_b and LOGIC_B_ENABLE_FIRST_EDGE_FORCE and (not first_edge_force_consumed) and best_moves:
-             # 预先检查 top-1 是否是 edge (需要先转 idx)
-             try:
-                 _cand_mv = str(best_moves[0])
-                 _cand_pos = _mv_to_idx(_cand_mv)
-                 if _cand_pos >= 0 and (legal_bb & (1 << _cand_pos)) and _is_edge(_cand_pos):
-                      use_oracle = True
-                      force_this_turn = True
-             except Exception:
-                 pass
+        force_oracle_this_turn = False
+        if is_mode_b and best_moves:
+            try:
+                _cand_mv = str(best_moves[0])
+                _cand_pos = _mv_to_idx(_cand_mv)
+                if _cand_pos >= 0 and (legal_bb & (1 << _cand_pos)):
+                    # Only force within early threshold (<=28 pcs)
+                    if (_is_edge(_cand_pos) or _is_c_square(_cand_pos)) and (pcs <= LOGIC_B_FORCE_EDGE_C_UNTIL_PCS):
+                        use_oracle = True
+                        force_oracle_this_turn = True
+            except Exception:
+                pass
 
         # 产生并点击落子
         pos: Optional[int] = None
@@ -1216,17 +1222,13 @@ def collect_game_12_to_53(
                 )
             
             # 逻辑B：pcs<LOGIC_B_FORBID_EDGE_C_UNTIL_PCS 时，oracle 命中 edge 或 C → 改用约束随机替代
-            # (除非是 force_this_turn)
-            if is_mode_b:
-                if force_this_turn:
-                     first_edge_force_consumed = True # Mark as consumed
-                else: 
-                     # Only apply restriction if NOT forced
-                     if pcs < LOGIC_B_FORBID_EDGE_C_UNTIL_PCS and (_is_edge(pos) or _is_c_square(pos)):
-                        pos_alt = _choose_move_logic_b(legal_bb, pcs, sys_rng=sys_rng)
-                        if pos_alt is not None:
-                            pos = pos_alt
-                            mv = _idx_to_mv(pos)
+            # 但若本轮因 edge/C 且 pcs<=28 被强制，则不做覆盖。
+            if is_mode_b and (not force_oracle_this_turn):
+                if pcs < LOGIC_B_FORBID_EDGE_C_UNTIL_PCS and (_is_edge(pos) or _is_c_square(pos)):
+                    pos_alt = _choose_move_logic_b(legal_bb, pcs, sys_rng=sys_rng)
+                    if pos_alt is not None:
+                        pos = pos_alt
+                        mv = _idx_to_mv(pos)
 
         if not use_oracle:
             # 噪声：逻辑B 使用均匀随机 + 约束；逻辑A 保留 C 抽样（此处通过回退实现）
